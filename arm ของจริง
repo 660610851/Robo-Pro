@@ -1,0 +1,374 @@
+import serial
+import time
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =============================
+# SERIAL
+# =============================
+ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+time.sleep(2)
+
+# =============================
+# DH PARAMETERS
+# =============================
+L0 = 0.028
+L1 = 0.22
+L2 = 0.20
+
+# =============================
+# SERVO CONSTANTS
+# =============================
+BASE  = 355
+WRIST = 405
+HOLE  = 110
+GRIP  = 520
+
+ESP_MIN = 100
+ESP_MAX = 600
+
+# =============================
+# WORKSPACE LIMITS
+# =============================
+MAX_REACH = L1 + L2 - 0.01
+MIN_REACH = 0.05
+
+# =============================
+# WORKSPACE BOUNDARY (for plot)
+# =============================
+_theta = np.linspace(0, 2 * math.pi, 400)
+wsx_outer = (L1 + L2) * np.cos(_theta)
+wsz_outer = L0 + (L1 + L2) * np.sin(_theta)
+wsx_inner = abs(L1 - L2) * np.cos(_theta)
+wsz_inner = L0 + abs(L1 - L2) * np.sin(_theta)
+
+# =============================
+# STATE
+# =============================
+home_origin_x = 0.0
+home_origin_z = 0.0
+current_x     = 0.0
+current_z     = 0.0
+typed_text    = ""
+
+# ตั้งมุมเริ่มต้นเป็น homePos
+_sh_init = -(200 - 395) / 1.5   # +130°
+_el_init = -(600 - 395) / 1.5   # -137°
+current_sh = math.radians(_sh_init)
+current_el = math.radians(_el_init)
+
+# =============================
+# GRAPH INIT (interactive keyboard)
+# =============================
+fig, ax = plt.subplots(figsize=(7, 7))
+
+# =============================
+# PULSE ↔ ANGLE
+# Calibrated จาก readyPos {sh=260→90°, el=530→-90°}
+# angle = -(pulse - 395) / 1.5
+# pulse = -(angle * 1.5) + 395
+# =============================
+SERVO_OFFSET = 395
+SERVO_SCALE  = 1.5   # และหมุนกลับทิศ (ลบ)
+
+def pulse_to_angle_deg(pulse):
+    """ESP pulse → degrees  (calibrated)"""
+    return -(pulse - SERVO_OFFSET) / SERVO_SCALE
+
+def angle_to_pulse(angle_deg):
+    """degrees → ESP pulse  (calibrated)"""
+    p = int(-angle_deg * SERVO_SCALE + SERVO_OFFSET)
+    return max(ESP_MIN, min(ESP_MAX, p))
+
+def shoulder_to_pulse(angle_deg):
+    """shoulder ใช้ scale เดียวกัน"""
+    return angle_to_pulse(angle_deg)
+
+# =============================
+# FORWARD KINEMATICS
+# =============================
+def fk(sh, el):
+    x = L1 * math.cos(sh) + L2 * math.cos(sh + el)
+    z = L0 + L1 * math.sin(sh) + L2 * math.sin(sh + el)
+    return x, z
+
+# =============================
+# INVERSE KINEMATICS
+# =============================
+def ik(x_real, z_real):
+    z_sh = z_real - L0
+    d = math.sqrt(x_real**2 + z_sh**2)
+    if d > MAX_REACH:
+        return None
+    if d < MIN_REACH:
+        return None
+    cos_el = (d**2 - L1**2 - L2**2) / (2 * L1 * L2)
+    cos_el = max(-1.0, min(1.0, cos_el))
+    elbow = -math.acos(cos_el)   # elbow-down ตรงกับท่า ready
+    k1 = L1 + L2 * math.cos(elbow)
+    k2 = L2 * math.sin(elbow)
+    shoulder = math.atan2(z_sh, x_real) - math.atan2(k2, k1)
+    return shoulder, elbow
+
+# =============================
+# COORDINATE CONVERSION
+# =============================
+def user_to_real(x, z):
+    return x + home_origin_x, z + home_origin_z
+
+def real_to_user(x, z):
+    return x - home_origin_x, z - home_origin_z
+
+# =============================
+# DRAW ARM
+# =============================
+def draw(note=""):
+    global typed_text
+    ax.clear()
+
+    sh = current_sh
+    el = current_el
+
+    x0, z0 = 0.0, L0
+    x1 = x0 + L1 * math.cos(sh)
+    z1 = z0 + L1 * math.sin(sh)
+    x2 = x1 + L2 * math.cos(sh + el)
+    z2 = z1 + L2 * math.sin(sh + el)
+    xu, zu = real_to_user(x2, z2)
+
+    # workspace boundary
+    ax.plot(wsx_outer, wsz_outer, 'g--', linewidth=1, alpha=0.5, label='Workspace')
+    ax.plot(wsx_inner, wsz_inner, 'g--', linewidth=1, alpha=0.5)
+
+    # arm
+    ax.plot([0, 0],   [0, L0], 'k-',  linewidth=4, label='Base')
+    ax.plot([x0, x1], [z0, z1], 'o-', linewidth=5, color='steelblue', label=f'Link1 {L1}m')
+    ax.plot([x1, x2], [z1, z2], 'o-', linewidth=5, color='tomato',    label=f'Link2 {L2}m')
+    ax.scatter(x2, z2, s=150, color='black', zorder=5)
+
+    # EE label
+    ax.text(x2 + 0.015, z2 + 0.015,
+            f"EE real ({x2:.3f}, {z2:.3f})\nuser ({xu:.3f}, {zu:.3f})",
+            fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.9))
+
+    # home origin marker
+    if home_origin_x != 0.0 or home_origin_z != 0.0:
+        ax.scatter(home_origin_x, home_origin_z, s=250,
+                   marker='*', color='gold', zorder=6, label='Origin (0,0)')
+
+    # joint angles info
+    ax.text(-0.45, 0.48,
+            f"Shoulder = {math.degrees(sh):.1f}°\nElbow    = {math.degrees(el):.1f}°",
+            fontsize=9, bbox=dict(facecolor='white', alpha=0.8))
+
+    # typed input display
+    ax.text(-0.45, 0.38,
+            f"Input x,z : {typed_text}_",
+            fontsize=9, bbox=dict(facecolor='lightyellow', alpha=0.8))
+
+    ax.set_xlim(-0.50, 0.55)
+    ax.set_ylim(-0.15, 0.55)
+    ax.set_xlabel("X (m)  [+ = ยื่นออกจากฐาน]")
+    ax.set_ylabel("Z (m)  [+ = ขึ้น]")
+    ax.set_title(f"Robot Arm  {note}\nType x,z then ENTER  |  home / ready0 / pos / q")
+    ax.legend(loc='upper right', fontsize=8)
+    ax.grid(True, alpha=0.4)
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+
+# =============================
+# SEND TO HARDWARE
+# =============================
+def send_arm(sh, el):
+    global current_sh, current_el
+    current_sh = sh
+    current_el = el
+    s = shoulder_to_pulse(math.degrees(sh))
+    e = angle_to_pulse(math.degrees(el))
+    cmd = f"ALL:{BASE},{s},{e},{WRIST},{GRIP},{HOLE}\n"
+    ser.write(cmd.encode())
+    print(f"  → {cmd.strip()}  [sh={math.degrees(sh):.1f}° el={math.degrees(el):.1f}°]")
+
+# =============================
+# HOME
+# =============================
+def home():
+    global home_origin_x, home_origin_z, current_x, current_z
+    global current_sh, current_el
+
+    ser.write(b"ALL:355,200,600,405,520,110\n")
+    time.sleep(0.5)
+
+    # home pose: คำนวณจาก pulse จริง
+    sh_deg = pulse_to_angle_deg(200)   # +130°
+    el_deg = pulse_to_angle_deg(600)   # -137°
+    sh = math.radians(sh_deg)
+    el = math.radians(el_deg)
+    current_sh = sh
+    current_el = el
+
+    real_x, real_z = fk(sh, el)
+    home_origin_x  = real_x
+    home_origin_z  = real_z
+    current_x      = 0.0
+    current_z      = 0.0
+
+    draw("HOME")
+    print("=" * 45)
+    print(f"HOME SET  sh={sh_deg:.1f}°  el={el_deg:.1f}°")
+    print(f"  real: x={real_x:.4f}  z={real_z:.4f}")
+    print(f"  user: x=0.000  z=0.000  ← origin")
+    print("=" * 45)
+
+# =============================
+# READY
+# =============================
+def ready(set_origin=False):
+    global current_x, current_z, current_sh, current_el
+    global home_origin_x, home_origin_z
+
+    ser.write(b"ALL:355,260,530,405,520,110\n")
+    time.sleep(0.5)
+
+    sh_deg = pulse_to_angle_deg(260)   # +90°
+    el_deg = pulse_to_angle_deg(530)   # -90°
+    sh = math.radians(sh_deg)
+    el = math.radians(el_deg)
+    current_sh = sh
+    current_el = el
+
+    real_x, real_z = fk(sh, el)
+
+    if set_origin:
+        home_origin_x = real_x
+        home_origin_z = real_z
+        current_x = 0.0
+        current_z = 0.0
+        print("READY → SET AS ORIGIN (0,0)")
+    else:
+        current_x, current_z = real_to_user(real_x, real_z)
+
+    draw("READY" + (" ← origin" if set_origin else ""))
+    print(f"  sh={sh_deg:.1f}°  el={el_deg:.1f}°  real({real_x:.3f},{real_z:.3f})  user({current_x:.3f},{current_z:.3f})")
+
+# =============================
+# MOVE TO
+# =============================
+def move_to(x_user, z_user):
+    global current_x, current_z
+
+    if home_origin_x == 0.0 and home_origin_z == 0.0:
+        print("[move_to] ERROR: พิมพ์ 'ready0' หรือ 'home' ก่อน")
+        return
+
+    rx, rz = user_to_real(x_user, z_user)
+    res = ik(rx, rz)
+    if res is None:
+        print(f"[IK] Out of reach  user=({x_user:.3f},{z_user:.3f})  real=({rx:.3f},{rz:.3f})")
+        return
+
+    sh, el = res
+    send_arm(sh, el)
+
+    real_x_actual, real_z_actual = fk(sh, el)
+    current_x, current_z = real_to_user(real_x_actual, real_z_actual)
+
+    draw()
+    print(f"Arrived → user x={current_x:.3f}  z={current_z:.3f}")
+
+# =============================
+# SHOW POSITION
+# =============================
+def show_pos():
+    rx, rz = user_to_real(current_x, current_z)
+    print(f"  User : x={current_x:.4f}  z={current_z:.4f}")
+    print(f"  Real : x={rx:.4f}  z={rz:.4f}")
+    print(f"  Joint: sh={math.degrees(current_sh):.1f}°  el={math.degrees(current_el):.1f}°")
+
+# =============================
+# KEYBOARD INPUT ON GRAPH
+# =============================
+def on_key(event):
+    global typed_text
+    if event.key == 'escape':
+        typed_text = ""
+        draw()
+        return
+    if event.key == 'backspace':
+        typed_text = typed_text[:-1]
+        draw()
+        return
+    if event.key == 'enter':
+        cmd = typed_text.strip()
+        typed_text = ""
+        print(f"\n[graph] >> {cmd}")
+        _handle_cmd(cmd)
+        return
+    if event.key and len(event.key) == 1:
+        typed_text += event.key
+        draw()
+
+def _handle_cmd(cmd):
+    if cmd == "q":
+        ser.close()
+        plt.close('all')
+        print("Serial closed.")
+        return
+    elif cmd == "home":
+        home()
+    elif cmd == "ready":
+        ready()
+    elif cmd == "ready0":
+        ready(set_origin=True)
+    elif cmd == "pos":
+        show_pos()
+    else:
+        try:
+            # รองรับทั้ง "x z" และ "x,z"
+            parts = cmd.replace(",", " ").split()
+            x, z = float(parts[0]), float(parts[1])
+            move_to(x, z)
+        except:
+            print(f"Invalid: '{cmd}'  format: x z  or  x,z")
+
+fig.canvas.mpl_connect('key_press_event', on_key)
+
+# =============================
+# STARTUP
+# =============================
+print("Robot Arm Controller Ready")
+print(f"  L0={L0}m  L1={L1}m  L2={L2}m  |  ESP pulse {ESP_MIN}~{ESP_MAX}")
+print()
+print("Commands (พิมพ์ในกราฟ หรือ terminal):")
+print("  home    → home position, set as user (0,0)")
+print("  ready   → ready position")
+print("  ready0  → ready + set as user (0,0)  ← เริ่มต้นที่นี่")
+print("  pos     → show position")
+print("  x z     → move  e.g.  0.05 0  หรือ  0.05,0")
+print("  q       → quit")
+print()
+print("*** พิมพ์ 'ready0' ก่อนเริ่มใช้งานทุกครั้ง ***")
+
+draw("ยังไม่ได้ set origin")
+
+# =============================
+# MAIN LOOP (terminal input ด้วย)
+# =============================
+plt.show(block=False)
+
+while plt.fignum_exists(fig.number):
+    try:
+        cmd = input("\n>> ").strip()
+        _handle_cmd(cmd)
+        if cmd == "q":
+            break
+    except KeyboardInterrupt:
+        break
+    except EOFError:
+        break
+
+ser.close()
+plt.close('all')
+print("Serial closed.")
