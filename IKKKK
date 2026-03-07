@@ -1,0 +1,510 @@
+import serial
+import time
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
+
+# =============================
+# SERIAL
+# =============================
+ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+time.sleep(2)
+
+# =============================
+# DH PARAMETERS
+# =============================
+L0 = 0.028
+L1 = 0.22
+L2 = 0.20
+
+# =============================
+# SERVO CONSTANTS
+# =============================
+BASE  = 355
+WRIST = 405
+HOLE  = 110
+GRIP  = 520
+
+ESP_MIN = 100
+ESP_MAX = 600
+
+# =============================
+# WORKSPACE LIMITS
+# =============================
+MAX_REACH = L1 + L2 - 0.01
+MIN_REACH = 0.05
+
+# =============================
+# WORKSPACE BOUNDARY
+# =============================
+_theta    = np.linspace(0, 2 * math.pi, 400)
+wsx_outer = (L1 + L2) * np.cos(_theta)
+wsz_outer = L0 + (L1 + L2) * np.sin(_theta)
+wsx_inner = abs(L1 - L2) * np.cos(_theta)
+wsz_inner = L0 + abs(L1 - L2) * np.sin(_theta)
+
+# =============================
+# SERVO CALIBRATION
+# readyPos: sh=260→90°, el=530→-90°
+# angle = -(pulse - 395) / 1.5
+# =============================
+SERVO_OFFSET = 395
+SERVO_SCALE  = 1.5
+
+def pulse_to_angle_deg(pulse):
+    return -(pulse - SERVO_OFFSET) / SERVO_SCALE
+
+def angle_to_pulse(angle_deg):
+    p = int(-angle_deg * SERVO_SCALE + SERVO_OFFSET)
+    return max(ESP_MIN, min(ESP_MAX, p))
+
+# =============================
+# STATE
+# =============================
+home_origin_x = 0.0
+home_origin_z = 0.0
+current_x     = 0.0
+current_z     = 0.0
+typed_text    = ""
+arm_speed     = 30      # ESP moveSteps (น้อย=เร็ว)
+grip_open     = True    # True=เปิด False=ปิด
+pump_on       = False   # True=ปั๊มทำงาน
+hole_vertical = False   # False=ขนาน(110) True=ตั้งฉาก(350)
+HOLE_FLAT = 110   # ขนาน
+HOLE_VERT = 350   # ตั้งฉาก
+
+# มุมเริ่มต้น = homePos
+current_sh = math.radians(pulse_to_angle_deg(200))   # +130°
+current_el = math.radians(pulse_to_angle_deg(600))   # -137°
+
+# =============================
+# GRAPH LAYOUT
+# =============================
+fig = plt.figure(figsize=(7, 8))
+ax        = fig.add_axes([0.10, 0.18, 0.85, 0.78])
+ax_slider = fig.add_axes([0.15, 0.06, 0.70, 0.04])
+
+speed_slider = Slider(
+    ax=ax_slider,
+    label='Speed (steps)',
+    valmin=5, valmax=80,
+    valinit=arm_speed,
+    valstep=1,
+    color='steelblue'
+)
+
+def on_speed_change(val):
+    global arm_speed
+    arm_speed = int(speed_slider.val)
+    print(f"  Speed → moveSteps={arm_speed}  ({'เร็ว' if arm_speed < 20 else 'กลาง' if arm_speed < 50 else 'ช้า'})")
+
+speed_slider.on_changed(on_speed_change)
+
+# =============================
+# FK / IK
+# =============================
+def fk(sh, el):
+    x = L1 * math.cos(sh) + L2 * math.cos(sh + el)
+    z = L0 + L1 * math.sin(sh) + L2 * math.sin(sh + el)
+    return x, z
+
+def ik(x_real, z_real):
+    z_sh = z_real - L0
+    d    = math.sqrt(x_real**2 + z_sh**2)
+    if d > MAX_REACH or d < MIN_REACH:
+        return None
+    cos_el = (d**2 - L1**2 - L2**2) / (2 * L1 * L2)
+    cos_el = max(-1.0, min(1.0, cos_el))
+    elbow  = -math.acos(cos_el)
+    k1     = L1 + L2 * math.cos(elbow)
+    k2     = L2 * math.sin(elbow)
+    shoulder = math.atan2(z_sh, x_real) - math.atan2(k2, k1)
+    return shoulder, elbow
+
+# =============================
+# COORDINATE CONVERSION
+# =============================
+def user_to_real(x, z):
+    return x + home_origin_x, z + home_origin_z
+
+def real_to_user(x, z):
+    return x - home_origin_x, z - home_origin_z
+
+# =============================
+# GRIPPER
+# =============================
+def gripper_open():
+    global grip_open
+    grip_open = True
+    ser.write(f"SPEED:{arm_speed}\n".encode())
+    time.sleep(0.02)
+    ser.write(b"GRIP:OPEN\n")
+    print("  Gripper → OPEN")
+    draw()
+
+def gripper_close():
+    global grip_open
+    grip_open = False
+    ser.write(f"SPEED:{arm_speed}\n".encode())
+    time.sleep(0.02)
+    ser.write(b"GRIP:CLOSE\n")
+    print("  Gripper → CLOSE")
+    draw()
+
+def gripper_toggle():
+    if grip_open:
+        gripper_close()
+    else:
+        gripper_open()
+
+# =============================
+# PUMP
+# =============================
+def pump_toggle():
+    global pump_on
+    if pump_on:
+        pump_on = False
+        ser.write(b"PUMP:OFF\n")
+        print("  Pump → OFF")
+    else:
+        pump_on = True
+        ser.write(b"PUMP:ON\n")
+        print("  Pump → ON")
+    draw()
+
+# =============================
+# HOLE SERVO
+# =============================
+def hole_toggle():
+    global hole_vertical
+    hole_vertical = not hole_vertical
+    pulse = HOLE_VERT if hole_vertical else HOLE_FLAT
+    ser.write(f"SPEED:{arm_speed}\n".encode())
+    time.sleep(0.02)
+    ser.write(f"SERVO:5:{pulse}\n".encode())
+    state = "ตั้งฉาก" if hole_vertical else "ขนาน"
+    print(f"  Hole → {state} (pulse={pulse})")
+    draw()
+
+# =============================
+# DRAW ARM
+# =============================
+def draw(note=""):
+    ax.clear()
+
+    sh = current_sh
+    el = current_el
+
+    x0, z0 = 0.0, L0
+    x1 = x0 + L1 * math.cos(sh)
+    z1 = z0 + L1 * math.sin(sh)
+    x2 = x1 + L2 * math.cos(sh + el)
+    z2 = z1 + L2 * math.sin(sh + el)
+    xu, zu = real_to_user(x2, z2)
+
+    # workspace boundary
+    ax.plot(wsx_outer, wsz_outer, 'g--', linewidth=1, alpha=0.4, label='Workspace')
+    ax.plot(wsx_inner, wsz_inner, 'g--', linewidth=1, alpha=0.4)
+
+    # arm
+    ax.plot([0, 0],   [0, L0], 'k-',  linewidth=4, label='Base')
+    ax.plot([x0, x1], [z0, z1], 'o-', linewidth=5, color='steelblue', label=f'Link1 {L1}m')
+    ax.plot([x1, x2], [z1, z2], 'o-', linewidth=5, color='tomato',    label=f'Link2 {L2}m')
+    ax.scatter(x2, z2, s=150, color='black', zorder=5)
+
+    # base origin
+    ax.scatter(0, 0, s=120, color='dimgray', marker='s', zorder=7, label='Base (0,0)')
+    ax.annotate('Base\n(0,0)', xy=(0, 0), xytext=(0.03, -0.08),
+                fontsize=7, color='dimgray',
+                arrowprops=dict(arrowstyle='->', color='dimgray', lw=1))
+
+    # user origin
+    if home_origin_x != 0.0 or home_origin_z != 0.0:
+        ax.scatter(home_origin_x, home_origin_z, s=250,
+                   marker='*', color='gold', zorder=6, label='Origin user')
+        ax.annotate(f'Origin\n({home_origin_x:.2f},{home_origin_z:.2f})',
+                    xy=(home_origin_x, home_origin_z),
+                    xytext=(home_origin_x + 0.04, home_origin_z - 0.06),
+                    fontsize=7, color='goldenrod',
+                    arrowprops=dict(arrowstyle='->', color='goldenrod', lw=1))
+
+    # EE label
+    ax.text(x2 + 0.015, z2 + 0.015,
+            f"EE real ({x2:.3f}, {z2:.3f})\nuser ({xu:.3f}, {zu:.3f})",
+            fontsize=8,
+            bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.9))
+
+    # status box
+    speed_label  = 'เร็ว' if arm_speed < 20 else 'กลาง' if arm_speed < 50 else 'ช้า'
+    grip_label   = 'OPEN  🟢' if grip_open else 'CLOSE 🔴'
+    pump_label   = 'ON  🟢' if pump_on   else 'OFF 🔴'
+
+    ax.text(-0.45, 0.50,
+            f"Shoulder = {math.degrees(sh):.1f}°\n"
+            f"Elbow    = {math.degrees(el):.1f}°\n"
+            f"Speed    = {arm_speed} ({speed_label})\n"
+            f"Gripper  = {grip_label}   [G]\n"
+            f"Pump     = {pump_label}  [P]\n"
+            f"Hole     = {'ตั้งฉาก 🟢' if hole_vertical else 'ขนาน  🔴'}  [T]",
+            fontsize=9, bbox=dict(facecolor='white', alpha=0.85),
+            family='monospace')
+
+    ax.text(-0.45, 0.26,
+            f"Input x,z : {typed_text}_",
+            fontsize=9, bbox=dict(facecolor='lightyellow', alpha=0.8))
+
+    ax.set_xlim(-0.50, 0.55)
+    ax.set_ylim(-0.15, 0.55)
+    ax.set_xlabel("X (m)  [+ = ยื่นออกจากฐาน]")
+    ax.set_ylabel("Z (m)  [+ = ขึ้น]")
+    ax.set_title(f"Robot Arm  {note}\n"
+                 f"x,z→ENTER  |  G=Gripper  P=Pump  |  home/ready0/pos/q\n"
+                 f"Speed slider ด้านล่าง (steps น้อย=เร็ว)")
+    ax.legend(loc='upper right', fontsize=7)
+    ax.grid(True, alpha=0.4)
+
+    fig.canvas.draw()
+    fig.canvas.flush_events()
+
+# =============================
+# SEND TO HARDWARE
+# =============================
+def send_arm(sh, el):
+    global current_sh, current_el
+    current_sh = sh
+    current_el = el
+    s = angle_to_pulse(math.degrees(sh))
+    e = angle_to_pulse(math.degrees(el))
+    ser.write(f"SPEED:{arm_speed}\n".encode())
+    time.sleep(0.02)   # รอ ESP รับ SPEED ก่อน
+    cmd = f"ALL:{BASE},{s},{e},{WRIST},{GRIP},{HOLE}\n"
+    ser.write(cmd.encode())
+    print(f"  → SPEED:{arm_speed}  {cmd.strip()}  [sh={math.degrees(sh):.1f}° el={math.degrees(el):.1f}°]")
+
+def set_speed(steps):
+    global arm_speed
+    arm_speed = max(5, min(80, steps))
+    speed_slider.set_val(arm_speed)
+    label = 'เร็ว' if arm_speed < 20 else 'กลาง' if arm_speed < 50 else 'ช้า'
+    print(f"  Speed → moveSteps={arm_speed} ({label})")
+    draw()
+
+# =============================
+# HOME
+# =============================
+def home():
+    global home_origin_x, home_origin_z, current_x, current_z
+    global current_sh, current_el
+
+    ser.write(b"ALL:355,200,600,405,520,110\n")
+    time.sleep(0.5)
+
+    sh_deg = pulse_to_angle_deg(200)
+    el_deg = pulse_to_angle_deg(600)
+    sh = math.radians(sh_deg)
+    el = math.radians(el_deg)
+    current_sh = sh
+    current_el = el
+
+    real_x, real_z = fk(sh, el)
+    home_origin_x  = real_x
+    home_origin_z  = real_z
+    current_x      = 0.0
+    current_z      = 0.0
+
+    draw("HOME")
+    print("=" * 45)
+    print(f"HOME  sh={sh_deg:.1f}°  el={el_deg:.1f}°")
+    print(f"  real: x={real_x:.4f}  z={real_z:.4f}")
+    print(f"  user: x=0.000  z=0.000")
+    print("=" * 45)
+
+# =============================
+# READY
+# =============================
+def ready(set_origin=False):
+    global current_x, current_z, current_sh, current_el
+    global home_origin_x, home_origin_z
+
+    ser.write(b"ALL:355,260,530,405,520,110\n")
+    time.sleep(0.5)
+
+    sh_deg = pulse_to_angle_deg(260)
+    el_deg = pulse_to_angle_deg(530)
+    sh = math.radians(sh_deg)
+    el = math.radians(el_deg)
+    current_sh = sh
+    current_el = el
+
+    real_x, real_z = fk(sh, el)
+
+    if set_origin:
+        home_origin_x = real_x
+        home_origin_z = real_z
+        current_x = 0.0
+        current_z = 0.0
+        print("READY → SET AS ORIGIN (0,0)")
+    else:
+        current_x, current_z = real_to_user(real_x, real_z)
+
+    draw("READY" + (" ← origin" if set_origin else ""))
+    print(f"  sh={sh_deg:.1f}°  el={el_deg:.1f}°  real({real_x:.3f},{real_z:.3f})  user({current_x:.3f},{current_z:.3f})")
+
+# =============================
+# MOVE TO
+# =============================
+def move_to(x_user, z_user):
+    global current_x, current_z
+
+    rx, rz = user_to_real(x_user, z_user)
+    res = ik(rx, rz)
+    if res is None:
+        print(f"[IK] Out of reach  user=({x_user:.3f},{z_user:.3f})  real=({rx:.3f},{rz:.3f})")
+        return
+
+    sh, el = res
+    send_arm(sh, el)
+
+    real_x_actual, real_z_actual = fk(sh, el)
+    current_x, current_z = real_to_user(real_x_actual, real_z_actual)
+
+    draw()
+    print(f"Arrived → user x={current_x:.3f}  z={current_z:.3f}")
+
+# =============================
+# SHOW POSITION
+# =============================
+def show_pos():
+    rx, rz = user_to_real(current_x, current_z)
+    print(f"  User : x={current_x:.4f}  z={current_z:.4f}")
+    print(f"  Real : x={rx:.4f}  z={rz:.4f}")
+    print(f"  Joint: sh={math.degrees(current_sh):.1f}°  el={math.degrees(current_el):.1f}°")
+    print(f"  Speed: {arm_speed} steps")
+    print(f"  Grip : {'OPEN' if grip_open else 'CLOSE'}")
+    print(f"  Pump : {'ON' if pump_on else 'OFF'}")
+
+# =============================
+# COMMAND HANDLER
+# =============================
+def _handle_cmd(cmd):
+    if cmd == "q":
+        ser.close()
+        plt.close('all')
+        print("Serial closed.")
+        return
+    elif cmd == "home":
+        home()
+    elif cmd == "ready":
+        ready()
+    elif cmd == "ready0":
+        ready(set_origin=True)
+    elif cmd == "pos":
+        show_pos()
+    elif cmd in ("g", "grip"):
+        gripper_toggle()
+    elif cmd == "grip open":
+        gripper_open()
+    elif cmd == "grip close":
+        gripper_close()
+    elif cmd in ("p", "pump"):
+        pump_toggle()
+    elif cmd in ("t", "hole"):
+        hole_toggle()
+    elif cmd.startswith("servo ") or cmd.startswith("SERVO:") or cmd.startswith("servo:"):
+        # format: servo 5 300  หรือ SERVO:5,300
+        try:
+            c = cmd.replace("SERVO:", "").replace("servo:", "").replace("servo ", "")
+            parts = c.replace(",", " ").split()
+            idx, val = int(parts[0]), int(parts[1])
+            ser.write(f"SERVO:{idx}:{val}\n".encode())
+            print(f"  SERVO:{idx} → pulse={val}")
+        except:
+            print("format: servo <idx> <pulse>  e.g. servo 5 350")
+    elif cmd.startswith("speed ") or cmd.startswith("spd "):
+        try:
+            set_speed(int(cmd.split()[1]))
+        except:
+            print("format: speed <5-80>")
+    else:
+        try:
+            parts = cmd.replace(",", " ").split()
+            x, z  = float(parts[0]), float(parts[1])
+            move_to(x, z)
+        except:
+            print(f"Invalid: '{cmd}'  format: x z  or  x,z")
+
+# =============================
+# KEYBOARD INPUT ON GRAPH
+# =============================
+def on_key(event):
+    global typed_text
+
+    # shortcut keys (ไม่ต้องกด Enter)
+    if event.key == 'g' and typed_text == "":
+        gripper_toggle()
+        return
+    if event.key == 'p' and typed_text == "":
+        pump_toggle()
+        return
+    if event.key == 't' and typed_text == "":
+        hole_toggle()
+        return
+
+    if event.key == 'escape':
+        typed_text = ""
+        draw()
+    elif event.key == 'backspace':
+        typed_text = typed_text[:-1]
+        draw()
+    elif event.key == 'enter':
+        cmd = typed_text.strip()
+        typed_text = ""
+        print(f"\n[graph] >> {cmd}")
+        _handle_cmd(cmd)
+    elif event.key and len(event.key) == 1:
+        typed_text += event.key
+        draw()
+
+fig.canvas.mpl_connect('key_press_event', on_key)
+
+# =============================
+# STARTUP
+# =============================
+print("Robot Arm Controller Ready")
+print(f"  L0={L0}m  L1={L1}m  L2={L2}m  |  ESP pulse {ESP_MIN}~{ESP_MAX}")
+print()
+print("Commands:")
+print("  home / ready / ready0 / pos / q")
+print("  x z          → move  e.g. 0.05 0")
+print("  speed <N>    → set speed (5=เร็ว, 80=ช้า)")
+print("  g / grip     → toggle gripper  (หรือกด G ในกราฟ)")
+print("  p / pump     → toggle pump     (หรือกด P ในกราฟ)")
+print("  grip open / grip close")
+print()
+
+# ขยับหุ่นไป home ทันที
+print("Moving to HOME...")
+ser.write(b"ALL:355,200,600,405,520,110\n")
+time.sleep(0.5)
+draw("HOME — พิมพ์ ready0 เพื่อเริ่มใช้งาน")
+
+# =============================
+# MAIN LOOP
+# =============================
+plt.show(block=False)
+
+while plt.fignum_exists(fig.number):
+    try:
+        cmd = input("\n>> ").strip()
+        _handle_cmd(cmd)
+        if cmd == "q":
+            break
+    except KeyboardInterrupt:
+        break
+    except EOFError:
+        break
+
+ser.close()
+plt.close('all')
+print("Serial closed.")
