@@ -1,0 +1,271 @@
+import serial
+import time
+import math
+import numpy as np
+import matplotlib.pyplot as plt
+
+# =============================
+# SERIAL
+# =============================
+ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
+time.sleep(2)
+
+# =============================
+# DH PARAMETERS
+# =============================
+L0 = 0.028   # base offset  z0 → z1
+L1 = 0.22    # link 1       z1 → z2
+L2 = 0.20    # link 2       z2 → z3
+
+# =============================
+# SERVO CONSTANTS
+# =============================
+BASE  = 355
+WRIST = 405
+HOLE  = 110
+GRIP  = 520
+
+SERVO_MIN = 150
+SERVO_MAX = 600
+
+# =============================
+# WORKSPACE LIMITS
+# =============================
+MAX_REACH = L1 + L2   # 0.42 m
+MIN_REACH = 0.05
+
+# =============================
+# HOME / READY ANGLES
+# pulse → angle = (pulse - 150) / 450 * 180 - 90
+#
+# HOME  : shoulder pulse=200 → -70.0°,  elbow pulse=600 → +90.0°
+# READY : shoulder pulse=260 → -46.0°,  elbow pulse=530 → +62.0°
+# =============================
+HOME_SHOULDER_DEG  = -70.0
+HOME_ELBOW_DEG     =  90.0
+
+READY_SHOULDER_DEG = -46.0
+READY_ELBOW_DEG    =  62.0
+
+# =============================
+# STATE
+# =============================
+home_origin_x = 0.0
+home_origin_z = 0.0
+
+current_x = 0.0
+current_z = 0.0
+
+print("Robot Arm Controller Ready")
+print(f"  L0={L0} m  L1={L1} m  L2={L2} m")
+
+# =============================
+# GRAPH INIT
+# =============================
+plt.ion()
+plt.figure(figsize=(7, 7))
+
+# =============================
+# HELPERS
+# =============================
+def pulse_to_angle(pulse):
+    """ESP pulse → joint angle (degrees)."""
+    return (pulse - SERVO_MIN) / (SERVO_MAX - SERVO_MIN) * 180.0 - 90.0
+
+def angle_to_pulse(angle_deg):
+    """Joint angle (degrees) → ESP pulse."""
+    pulse = int(SERVO_MIN + ((angle_deg + 90.0) / 180.0) * (SERVO_MAX - SERVO_MIN))
+    return max(SERVO_MIN, min(SERVO_MAX, pulse))
+
+# =============================
+# FORWARD KINEMATICS
+# =============================
+def fk(shoulder_rad, elbow_rad):
+    x = L1 * math.cos(shoulder_rad) + L2 * math.cos(shoulder_rad + elbow_rad)
+    z = L0 + L1 * math.sin(shoulder_rad) + L2 * math.sin(shoulder_rad + elbow_rad)
+    return x, z
+
+# =============================
+# INVERSE KINEMATICS
+# =============================
+def ik(x_real, z_real):
+    z_sh = z_real - L0
+    d = math.sqrt(x_real**2 + z_sh**2)
+
+    if d > MAX_REACH:
+        print(f"[IK] Out of reach: d={d:.4f} > MAX={MAX_REACH:.4f}")
+        return None
+    if d < MIN_REACH:
+        print(f"[IK] Too close: d={d:.4f} < MIN={MIN_REACH:.4f}")
+        return None
+
+    cos_elbow = (d**2 - L1**2 - L2**2) / (2 * L1 * L2)
+    cos_elbow = max(-1.0, min(1.0, cos_elbow))
+    elbow = -math.acos(cos_elbow)
+
+    k1 = L1 + L2 * math.cos(elbow)
+    k2 = L2 * math.sin(elbow)
+    shoulder = math.atan2(z_sh, x_real) - math.atan2(k2, k1)
+
+    return shoulder, elbow
+
+# =============================
+# COORDINATE CONVERSION
+# =============================
+def user_to_real(x_user, z_user):
+    return x_user + home_origin_x, z_user + home_origin_z
+
+def real_to_user(x_real, z_real):
+    return x_real - home_origin_x, z_real - home_origin_z
+
+# =============================
+# DRAW ARM
+# =============================
+def plot_arm(shoulder_rad, elbow_rad):
+    x0, z0 = 0.0, L0
+    x1 = x0 + L1 * math.cos(shoulder_rad)
+    z1 = z0 + L1 * math.sin(shoulder_rad)
+    x2 = x1 + L2 * math.cos(shoulder_rad + elbow_rad)
+    z2 = z1 + L2 * math.sin(shoulder_rad + elbow_rad)
+
+    x2_user, z2_user = real_to_user(x2, z2)
+
+    plt.clf()
+    plt.plot([0, 0],   [0, L0], 'k-',  linewidth=3, label='Base')
+    plt.plot([x0, x1], [z0, z1], 'o-', linewidth=5, color='steelblue', label='Link1')
+    plt.plot([x1, x2], [z1, z2], 'o-', linewidth=5, color='tomato',    label='Link2')
+    plt.scatter(x2, z2, s=120, color='black', zorder=5)
+    plt.text(x2 + 0.015, z2 + 0.015,
+             f"user: x={x2_user:.3f}\n      z={z2_user:.3f}",
+             fontsize=9, bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.8))
+    plt.scatter(home_origin_x, home_origin_z, s=200, marker='*', color='gold', zorder=6, label='Home(0,0)')
+    plt.xlim(-0.50, 0.50)
+    plt.ylim(-0.20, 0.55)
+    plt.xlabel("X (m)")
+    plt.ylabel("Z (m)")
+    plt.title("Robot Arm — X-Z Plane")
+    plt.legend(loc='upper left', fontsize=8)
+    plt.grid(True, alpha=0.4)
+    plt.pause(0.001)
+
+# =============================
+# SEND TO HARDWARE
+# =============================
+def send_arm(shoulder_rad, elbow_rad):
+    s = angle_to_pulse(math.degrees(shoulder_rad))
+    e = angle_to_pulse(math.degrees(elbow_rad))
+    cmd = f"ALL:{BASE},{s},{e},{WRIST},{GRIP},{HOLE}\n"
+    ser.write(cmd.encode())
+    print(f"  → {cmd.strip()}")
+
+# =============================
+# HOME
+# =============================
+def home():
+    global home_origin_x, home_origin_z, current_x, current_z
+
+    ser.write(b"ALL:355,200,600,405,520,110\n")
+    time.sleep(0.5)
+
+    sh = math.radians(HOME_SHOULDER_DEG)
+    el = math.radians(HOME_ELBOW_DEG)
+
+    real_x, real_z = fk(sh, el)
+    home_origin_x = real_x
+    home_origin_z = real_z
+    current_x = 0.0
+    current_z = 0.0
+
+    plot_arm(sh, el)
+
+    print("=" * 40)
+    print(f"HOME SET  shoulder={HOME_SHOULDER_DEG}°  elbow={HOME_ELBOW_DEG}°")
+    print(f"  Real: x={real_x:.4f}  z={real_z:.4f}")
+    print(f"  User: x=0.000  z=0.000")
+    print("=" * 40)
+
+# =============================
+# READY
+# =============================
+def ready():
+    global current_x, current_z
+
+    # ส่ง pulse ตรงๆ เหมือน ESP — ครั้งเดียว ไม่ซ้ำ
+    ser.write(b"ALL:355,260,530,405,520,110\n")
+    time.sleep(0.5)
+
+    sh = math.radians(READY_SHOULDER_DEG)
+    el = math.radians(READY_ELBOW_DEG)
+
+    real_x, real_z = fk(sh, el)
+    current_x, current_z = real_to_user(real_x, real_z)
+
+    plot_arm(sh, el)
+
+    print("READY POSITION")
+    print(f"  Real: x={real_x:.3f}  z={real_z:.3f}")
+    print(f"  User: x={current_x:.3f}  z={current_z:.3f}")
+
+# =============================
+# SMOOTH MOTION
+# =============================
+def move_to(x_user, z_user, steps=40):
+    global current_x, current_z
+
+    xs = np.linspace(current_x, x_user, steps)
+    zs = np.linspace(current_z, z_user, steps)
+
+    for i in range(steps):
+        rx, rz = user_to_real(xs[i], zs[i])
+        result = ik(rx, rz)
+        if result is None:
+            print(f"[move_to] IK failed at step {i}  user=({xs[i]:.3f},{zs[i]:.3f})  real=({rx:.3f},{rz:.3f})")
+            return
+        shoulder, elbow = result
+        send_arm(shoulder, elbow)
+        plot_arm(shoulder, elbow)
+        time.sleep(0.03)
+
+    current_x = x_user
+    current_z = z_user
+    print(f"Arrived → user x={current_x:.3f}  z={current_z:.3f}")
+
+# =============================
+# SHOW POSITION
+# =============================
+def show_pos():
+    real_x, real_z = user_to_real(current_x, current_z)
+    print(f"  User : x={current_x:.4f}  z={current_z:.4f}")
+    print(f"  Real : x={real_x:.4f}  z={real_z:.4f}")
+    print(f"  Home : x={home_origin_x:.4f}  z={home_origin_z:.4f}  (real world)")
+
+# =============================
+# MAIN LOOP
+# =============================
+print("\nCommands:")
+print("  home   → go to home, set as (0,0)")
+print("  ready  → move to ready pose")
+print("  pos    → show current position")
+print("  x z    → move to user coordinates  e.g. 0.1 0.05")
+print("  q      → quit")
+
+while True:
+    cmd = input("\n>> ").strip()
+
+    if cmd == "q":
+        break
+    elif cmd == "home":
+        home()
+    elif cmd == "ready":
+        ready()
+    elif cmd == "pos":
+        show_pos()
+    else:
+        try:
+            x, z = map(float, cmd.split())
+            move_to(x, z)
+        except ValueError:
+            print("Invalid input. Enter: x z  (e.g. 0.1 0.0)")
+
+ser.close()
+print("Serial closed.")
