@@ -1,0 +1,236 @@
+import serial
+import time
+import math
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ===== Serial =====
+ser = serial.Serial('/dev/ttyUSB3',115200,timeout=1)
+time.sleep(2)
+
+# ===== Arm length =====
+L1 = 15
+L2 = 15
+
+# ===== Servo default =====
+BASE = 355
+WRIST = 405
+HOLE = 110
+
+# ===== Position preset =====
+HOME = [355,200,600,405,520,110]
+READY = [355,260,530,405,520,110]
+
+# ===== Gripper =====
+GRIP_OPEN = 520
+GRIP_CLOSE = 420
+grip_state = GRIP_OPEN
+
+
+# ===== convert angle -> servo pulse =====
+def angle_to_pulse(angle):
+    return int(150 + (angle/180.0)*(600-150))
+
+
+# ===== Inverse Kinematics =====
+def ik(x,z):
+
+    d = math.sqrt(x*x + z*z)
+
+    if d > (L1+L2) or d < abs(L1-L2):
+        print("Out of workspace")
+        return None
+
+    cos_elbow = (x*x + z*z - L1*L1 - L2*L2)/(2*L1*L2)
+    elbow = math.acos(cos_elbow)
+
+    k1 = L1 + L2*math.cos(elbow)
+    k2 = L2*math.sin(elbow)
+
+    shoulder = math.atan2(z,x) - math.atan2(k2,k1)
+
+    return shoulder, elbow
+
+
+# ===== send servo command =====
+def send_all(b,s,e,w,g,h):
+
+    cmd = f"ALL:{b},{s},{e},{w},{g},{h}\n"
+    ser.write(cmd.encode())
+    print("SEND:",cmd)
+
+
+# ===== send IK result =====
+def send_arm(shoulder, elbow):
+
+    shoulder_deg = math.degrees(shoulder)
+    elbow_deg = math.degrees(elbow)
+
+    s_pulse = angle_to_pulse(shoulder_deg+90)
+    e_pulse = angle_to_pulse(elbow_deg)
+
+    send_all(BASE,s_pulse,e_pulse,WRIST,grip_state,HOLE)
+
+
+# ===== Home =====
+def go_home():
+
+    print("Go HOME")
+    send_all(*HOME)
+
+
+# ===== Ready =====
+def go_ready():
+
+    print("Go READY")
+    send_all(*READY)
+
+
+# ===== Toggle gripper =====
+def toggle_gripper():
+
+    global grip_state
+
+    if grip_state == GRIP_OPEN:
+
+        grip_state = GRIP_CLOSE
+        ser.write(b"GRIP:CLOSE\n")
+        print("Gripper CLOSE")
+
+    else:
+
+        grip_state = GRIP_OPEN
+        ser.write(b"GRIP:OPEN\n")
+        print("Gripper OPEN")
+
+
+# ===== open gripper =====
+def open_gripper():
+
+    global grip_state
+    grip_state = GRIP_OPEN
+    ser.write(b"GRIP:OPEN\n")
+    print("Gripper OPEN")
+
+
+# ===== close gripper =====
+def close_gripper():
+
+    global grip_state
+    grip_state = GRIP_CLOSE
+    ser.write(b"GRIP:CLOSE\n")
+    print("Gripper CLOSE")
+
+
+# ===== Workspace plot =====
+def draw_workspace():
+
+    theta1 = np.linspace(-math.pi/2, math.pi/2,100)
+    theta2 = np.linspace(0, math.pi,100)
+
+    xs=[]
+    zs=[]
+
+    for t1 in theta1:
+        for t2 in theta2:
+
+            x = L1*math.cos(t1) + L2*math.cos(t1+t2)
+            z = L1*math.sin(t1) + L2*math.sin(t1+t2)
+
+            xs.append(x)
+            zs.append(z)
+
+    plt.scatter(xs,zs,s=1,alpha=0.1)
+
+
+# ===== Plot arm =====
+def plot_arm(shoulder, elbow):
+
+    x1 = L1*math.cos(shoulder)
+    z1 = L1*math.sin(shoulder)
+
+    x2 = x1 + L2*math.cos(shoulder+elbow)
+    z2 = z1 + L2*math.sin(shoulder+elbow)
+
+    plt.clf()
+
+    draw_workspace()
+
+    plt.plot([0,x1],[0,z1],'o-',linewidth=4)
+    plt.plot([x1,x2],[z1,z2],'o-',linewidth=4)
+
+    plt.scatter(x2,z2,s=100)
+
+    plt.xlim(-30,30)
+    plt.ylim(-5,30)
+
+    plt.xlabel("X")
+    plt.ylabel("Z")
+    plt.title("Robot Arm")
+
+    plt.grid()
+    plt.pause(0.01)
+
+
+# ===== interactive =====
+plt.ion()
+
+print("""
+Commands
+--------
+home
+ready
+x z
+g
+open
+close
+q
+""")
+
+while True:
+
+    cmd = input("Command: ")
+
+    if cmd == "q":
+        break
+
+    if cmd == "home":
+        go_home()
+        continue
+
+    if cmd == "ready":
+        go_ready()
+        continue
+
+    if cmd == "g":
+        toggle_gripper()
+        continue
+
+    if cmd == "open":
+        open_gripper()
+        continue
+
+    if cmd == "close":
+        close_gripper()
+        continue
+
+    try:
+
+        x,z = map(float,cmd.split())
+
+        res = ik(x,z)
+
+        if res is None:
+            continue
+
+        shoulder, elbow = res
+
+        print("Shoulder:",round(math.degrees(shoulder),2))
+        print("Elbow:",round(math.degrees(elbow),2))
+
+        send_arm(shoulder,elbow)
+
+        plot_arm(shoulder,elbow)
+
+    except:
+        print("Invalid input")
