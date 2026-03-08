@@ -1,0 +1,205 @@
+import cv2
+import numpy as np
+from pupil_apriltags import Detector
+
+# =========================
+# STREAM FROM PI
+# =========================
+
+PI_IP = "pingg.local"
+STREAM_URL = f"http://{PI_IP}:5000/stream"
+
+cap = cv2.VideoCapture(STREAM_URL)
+cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+
+# =========================
+# APRILTAG DETECTOR
+# =========================
+
+at_detector = Detector(
+    families="tagStandard52h13",
+    nthreads=2,
+    quad_decimate=1.0,
+    quad_sigma=0.0,
+    refine_edges=1,
+    decode_sharpening=0.25
+)
+
+# =========================
+# TAG LOCK SYSTEM
+# =========================
+
+target_tag = None
+lost_count = 0
+MAX_LOST = 15
+
+
+# =========================
+# HELPERS
+# =========================
+
+def decode_tagid_5digits(tag_id):
+
+    tag_str = f"{tag_id:05d}"
+
+    planting_distance = int(tag_str[0:2])
+    spacing_gap = int(tag_str[2]) * 5
+    cabbage_interval = int(tag_str[3:5])
+
+    return tag_str, planting_distance, spacing_gap, cabbage_interval
+
+
+def tag_area(tag):
+
+    corners = tag.corners
+    w = np.linalg.norm(corners[0] - corners[1])
+    h = np.linalg.norm(corners[1] - corners[2])
+
+    return w * h
+
+
+# =========================
+# MAIN LOOP
+# =========================
+
+print("Press q to quit")
+
+while True:
+
+    ret, frame = cap.read()
+
+    if not ret:
+        continue
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    tags = at_detector.detect(gray)
+
+    chosen = None
+
+    # =========================
+    # SELECT TARGET TAG
+    # =========================
+
+    if target_tag is None:
+
+        if tags:
+            # เลือก tag ที่ใหญ่สุด
+            chosen = max(tags, key=tag_area)
+            target_tag = chosen.tag_id
+            lost_count = 0
+
+    else:
+
+        found = None
+
+        for t in tags:
+            if t.tag_id == target_tag:
+                found = t
+                break
+
+        if found is not None:
+            chosen = found
+            lost_count = 0
+        else:
+            lost_count += 1
+
+        if lost_count >= MAX_LOST:
+            target_tag = None
+            lost_count = 0
+
+    # =========================
+    # DRAW TAG
+    # =========================
+
+    if chosen is not None:
+
+        tag_str, planting, spacing, interval = decode_tagid_5digits(chosen.tag_id)
+
+        corners = chosen.corners.astype(int)
+
+        for i in range(4):
+            p1 = tuple(corners[i])
+            p2 = tuple(corners[(i+1)%4])
+            cv2.line(frame,p1,p2,(0,255,0),2)
+
+        cx,cy = map(int,chosen.center)
+
+        cv2.drawMarker(
+            frame,
+            (cx,cy),
+            (0,0,255),
+            cv2.MARKER_CROSS,
+            20,
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"TAG {tag_str}",
+            (10,30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255,255,255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"Plant Dist: {planting} cm",
+            (10,60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255,255,255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"Spacing: {spacing} cm",
+            (10,90),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255,255,255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"Cabbage Gap: {interval} cm",
+            (10,120),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255,255,255),
+            2
+        )
+
+        cv2.putText(
+            frame,
+            f"Center(px): ({cx},{cy})",
+            (10,150),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (200,200,200),
+            2
+        )
+
+    else:
+
+        cv2.putText(
+            frame,
+            "Searching Tag...",
+            (10,30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0,0,255),
+            2
+        )
+
+    cv2.imshow("AprilTag Tracking",frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
