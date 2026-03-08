@@ -1,0 +1,351 @@
+import cv2
+import numpy as np
+import os
+import json
+from ultralytics import YOLO
+
+# =============================
+# MODEL PATH
+# =============================
+
+POT_MODEL_PATH = r"C:\Users\ASUS\Downloads\pot.pt"
+CAB_MODEL_PATH = r"C:\Users\ASUS\Downloads\cabbage.pt"
+
+pot_model = YOLO(POT_MODEL_PATH)
+cab_model = YOLO(CAB_MODEL_PATH)
+
+# =============================
+# CAMERA (Pi stream)
+# =============================
+
+PI_IP = "pingg.local"
+STREAM_URL = f"http://{PI_IP}:5001/stream"   # track camera ใช้ port 5001
+
+cap = cv2.VideoCapture(STREAM_URL)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+# =============================
+# SETTINGS
+# =============================
+
+CONF = 0.35
+IMGSZ = 640
+
+KNOWN_LEN_CM = 15.0
+CAB_THRESH = 15.0
+CALIB_PATH = "track_calibration_px_per_cm.json"
+
+# ค่าเริ่มต้น ถ้ายังไม่ calibrate
+px_per_cm = None
+
+# =============================
+# POT TRACKING
+# =============================
+
+target_box = None
+lost_count = 0
+MAX_LOST = 15
+
+
+# =============================
+# CALIBRATION HELPERS
+# =============================
+
+def load_px_per_cm():
+    if os.path.exists(CALIB_PATH):
+        with open(CALIB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        v = float(data.get("px_per_cm", 0.0))
+        return v if v > 0 else None
+    return None
+
+
+def save_px_per_cm(value):
+    with open(CALIB_PATH, "w", encoding="utf-8") as f:
+        json.dump({"px_per_cm": float(value)}, f, ensure_ascii=False, indent=2)
+
+
+class ClickMeasure:
+    def __init__(self):
+        self.pts = []
+
+    def cb(self, event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(self.pts) < 2:
+            self.pts.append((x, y))
+
+
+def calibrate_px_per_cm(frame, known_len_cm=15.0):
+    cm = ClickMeasure()
+    win = "CALIBRATE: click 2 points | ENTER confirm | ESC cancel"
+
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+    cv2.setMouseCallback(win, cm.cb)
+
+    while True:
+        disp = frame.copy()
+
+        cv2.putText(
+            disp,
+            f"Click 2 points that are {known_len_cm:.1f} cm apart",
+            (20, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 255),
+            2
+        )
+
+        for p in cm.pts:
+            cv2.circle(disp, p, 6, (0, 0, 255), -1)
+
+        if len(cm.pts) == 2:
+            p1, p2 = cm.pts
+            cv2.line(disp, p1, p2, (0, 255, 0), 2)
+
+            dist_px = float(np.linalg.norm(np.array(p1) - np.array(p2)))
+            px_per_cm_now = dist_px / known_len_cm
+
+            cv2.putText(
+                disp,
+                f"dist_px={dist_px:.1f} -> px_per_cm={px_per_cm_now:.2f}",
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 255, 0),
+                2
+            )
+
+        cv2.imshow(win, disp)
+        key = cv2.waitKey(20) & 0xFF
+
+        if key == 27:   # ESC
+            cv2.destroyWindow(win)
+            return None
+
+        if key == 13:   # ENTER
+            if len(cm.pts) < 2:
+                continue
+
+            p1, p2 = cm.pts
+            dist_px = float(np.linalg.norm(np.array(p1) - np.array(p2)))
+            if dist_px <= 1:
+                cv2.destroyWindow(win)
+                return None
+
+            px_per_cm_now = dist_px / known_len_cm
+            cv2.destroyWindow(win)
+            return px_per_cm_now
+
+
+# =============================
+# OTHER HELPERS
+# =============================
+
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    iw = max(0, ix2 - ix1)
+    ih = max(0, iy2 - iy1)
+
+    inter = iw * ih
+
+    areaA = max(1, (ax2 - ax1) * (ay2 - ay1))
+    areaB = max(1, (bx2 - bx1) * (by2 - by1))
+
+    return inter / (areaA + areaB - inter + 1e-6)
+
+
+# =============================
+# LOAD CALIBRATION
+# =============================
+
+px_per_cm = load_px_per_cm()
+
+print("Controls: q quit | c calibrate cabbage scale")
+
+# =============================
+# MAIN LOOP
+# =============================
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        continue
+
+    vis = frame.copy()
+
+    # =============================
+    # POT DETECTION
+    # =============================
+
+    pot_res = pot_model.predict(frame, conf=CONF, imgsz=IMGSZ, verbose=False)[0]
+
+    boxes = []
+
+    if pot_res.boxes is not None:
+        for b in pot_res.boxes:
+            x1, y1, x2, y2 = b.xyxy[0].cpu().numpy().astype(int)
+            conf = float(b.conf[0])
+            boxes.append(((x1, y1, x2, y2), conf))
+
+    chosen = None
+
+    if target_box is None:
+        if boxes:
+            chosen = max(boxes, key=lambda t: t[1])[0]
+            target_box = chosen
+            lost_count = 0
+
+    else:
+        if boxes:
+            best = max(boxes, key=lambda t: iou(target_box, t[0]))
+
+            if iou(target_box, best[0]) > 0.1:
+                chosen = best[0]
+                target_box = chosen
+                lost_count = 0
+            else:
+                lost_count += 1
+        else:
+            lost_count += 1
+
+        if lost_count >= MAX_LOST:
+            target_box = None
+            lost_count = 0
+
+    if chosen is not None:
+        x1, y1, x2, y2 = chosen
+        pot_cx = (x1 + x2) // 2
+        pot_cy = (y1 + y2) // 2
+
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (255, 0, 255), 3)
+        cv2.drawMarker(vis, (pot_cx, pot_cy), (0, 0, 255), cv2.MARKER_CROSS, 25, 2)
+
+        cv2.putText(
+            vis,
+            f"POT CENTER ({pot_cx},{pot_cy})",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 255, 255),
+            2
+        )
+
+    else:
+        cv2.putText(
+            vis,
+            "No pot target",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 0, 255),
+            2
+        )
+
+    # =============================
+    # CABBAGE DETECTION
+    # =============================
+
+    cab_res = cab_model.predict(frame, conf=CONF, imgsz=IMGSZ, verbose=False)[0]
+
+    if cab_res.boxes is not None:
+        for b in cab_res.boxes:
+            x1, y1, x2, y2 = b.xyxy[0].cpu().numpy().astype(int)
+
+            w = x2 - x1
+            h = y2 - y1
+
+            diam_px = min(w, h)
+            cab_cx = (x1 + x2) // 2
+            cab_cy = (y1 + y2) // 2
+
+            if px_per_cm is not None and px_per_cm > 0:
+                diam_cm = diam_px / px_per_cm
+            else:
+                diam_cm = None
+
+            if diam_cm is None:
+                color = (0, 255, 255)
+                status = "NO CALIB"
+                size_text = f"{diam_px}px"
+            else:
+                if diam_cm >= CAB_THRESH:
+                    color = (0, 255, 0)
+                    status = "CAN COLLECT"
+                else:
+                    color = (0, 0, 255)
+                    status = "WAIT"
+                size_text = f"{diam_cm:.1f} cm"
+
+            cv2.circle(vis, (cab_cx, cab_cy), max(2, diam_px // 2), color, 2)
+
+            cv2.putText(
+                vis,
+                size_text,
+                (cab_cx - 25, cab_cy - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                color,
+                2
+            )
+
+            cv2.putText(
+                vis,
+                status,
+                (cab_cx - 40, cab_cy + 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
+
+    # =============================
+    # INFO TEXT
+    # =============================
+
+    if px_per_cm is None:
+        cv2.putText(
+            vis,
+            "Scale: NONE | press c to calibrate 15 cm",
+            (10, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2
+        )
+    else:
+        cv2.putText(
+            vis,
+            f"Scale: {px_per_cm:.2f} px/cm | 15 cm threshold",
+            (10, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2
+        )
+
+    # =============================
+    # DISPLAY
+    # =============================
+
+    cv2.imshow("Robot Vision (Pot + Cabbage)", vis)
+
+    key = cv2.waitKey(1) & 0xFF
+
+    if key == ord("q"):
+        break
+
+    if key == ord("c"):
+        pxcm = calibrate_px_per_cm(frame, KNOWN_LEN_CM)
+        if pxcm is not None:
+            px_per_cm = float(pxcm)
+            save_px_per_cm(px_per_cm)
+            print(f"[CALIB SAVED] px_per_cm = {px_per_cm:.4f}")
+
+cap.release()
+cv2.destroyAllWindows()
