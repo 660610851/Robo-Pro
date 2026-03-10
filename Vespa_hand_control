@@ -1,0 +1,411 @@
+import rclpy
+from rclpy.node import Node
+
+import cv2
+import mediapipe as mp
+
+from geometry_msgs.msg import Twist
+
+
+class GestureControl(Node):
+
+    def __init__(self):
+
+        super().__init__('gesture_control')
+
+        self.publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+
+        self.cap = cv2.VideoCapture(0)
+
+        self.mp_hands = mp.solutions.hands
+        self.mp_draw = mp.solutions.drawing_utils
+        self.hands = self.mp_hands.Hands(
+            max_num_hands=2,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7
+        )
+
+        self.speed = 0.3
+        self.max_speed = 1.0
+
+        self.angular_speed = 0.5
+        self.max_angular = 1.5
+
+        self.linear_mode = True
+        self.mode_button = None
+        self.button_pressed = False
+
+        self.slider = None
+
+        self.last_gesture = "STOP"
+        self.gesture_count = 0
+        self.required_frames = 5
+
+        self.timer = self.create_timer(0.03, self.loop)
+
+    def detect_gesture(self, lm, w, h):
+
+        # finger tips
+        tips = [4,8,12,16,20]
+
+        # finger joints
+        pips = [3,6,10,14,18]
+
+        fingers = []
+
+        for i in range(1,5):
+
+            tip = lm[tips[i]]
+            pip = lm[pips[i]]
+
+            if tip.y < pip.y:
+                fingers.append(1)
+            else:
+                fingers.append(0)
+
+        index = fingers[0]
+        middle = fingers[1]
+        ring = fingers[2]
+        pinky = fingers[3]
+
+        # ======================
+        # FIST
+        # ======================
+
+        if sum(fingers) == 0:
+            return "STOP"
+
+        # ======================
+        # INDEX
+        # ======================
+
+        if index == 1 and middle == 0 and ring == 0 and pinky == 0:
+            return "LEFT"
+
+        # ======================
+        # INDEX + MIDDLE
+        # ======================
+
+        if index == 1 and middle == 1 and ring == 0 and pinky == 0:
+            return "RIGHT"
+                
+        # ======================
+        # THUMB ROTATION
+        # ======================
+
+        thumb_tip = lm[4]
+        thumb_ip = lm[3]
+
+        thumb_open = thumb_tip.y < thumb_ip.y
+
+        thumb_right = thumb_tip.x > thumb_ip.x + 0.03
+        thumb_left  = thumb_tip.x < thumb_ip.x - 0.03
+
+        # 👍 CW
+        if thumb_open and thumb_right:
+            return "CW"
+
+        # 👎 CCW
+        if thumb_open and thumb_left:
+            return "CCW"
+
+        # ======================
+        # PALM OPEN (FORWARD / BACKWARD)
+        # ======================
+
+        if sum(fingers) >= 3:
+
+            thumb = lm[4]
+            index_mcp = lm[5]
+            pinky_mcp = lm[17]
+
+            thumb_x = thumb.x
+            index_x = index_mcp.x
+            pinky_x = pinky_mcp.x
+
+            palm_center = (index_x + pinky_x) / 2
+
+            # thumb อยู่ด้านนอก → ฝ่ามือเข้า
+            if thumb_x < palm_center:
+                return "FORWARD"
+            else:
+                return "BACKWARD"
+
+        return "STOP"
+        
+    def gesture_filter(self, gesture):
+
+        if gesture == self.last_gesture:
+            self.gesture_count += 1
+        else:
+            self.gesture_count = 0
+            self.last_gesture = gesture
+
+        if self.gesture_count > self.required_frames:
+            return gesture
+
+        return None
+
+    def check_mode_toggle(self,x,y):
+
+        if self.mode_button is None:
+            return
+
+        x1,y1,x2,y2 = self.mode_button
+
+        inside = x1 < x < x2 and y1 < y < y2
+
+        if inside and not self.button_pressed:
+
+            self.linear_mode = not self.linear_mode
+            self.button_pressed = True
+
+        elif not inside:
+
+            self.button_pressed = False
+
+    def draw_slider(self, frame):
+
+        x = 10
+        y = 60
+
+        w_slider = 220
+        h = 20
+        button_h = 70   # ความสูงปุ่ม (เพิ่มตรงนี้)
+
+        if self.linear_mode:
+            value = self.speed
+            max_val = self.max_speed
+            label = "Linear Speed"
+            color = (0,255,255)
+        else:
+            value = self.angular_speed
+            max_val = self.max_angular
+            label = "Angular Speed"
+            color = (255,255,0)
+
+        cv2.putText(
+            frame,
+            f"{label}: {value:.2f}",
+            (x, y-15),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2
+        )
+
+        cv2.rectangle(frame,(x,y),(x+w_slider,y+h),color,2)
+
+        fill = int((value/max_val)*w_slider)
+
+        cv2.rectangle(frame,(x,y),(x+fill,y+h),color,-1)
+
+        self.slider = (x,y,x+w_slider,y+h)
+
+        bw = 70
+        gap = 15
+
+        bx = x + w_slider + gap
+        by = y - 50  # ขยับขึ้นเล็กน้อยให้สมดุล
+
+        cv2.rectangle(frame,(bx,by),(bx+bw,by+button_h),color,2)
+
+        text = "LIN" if self.linear_mode else "ANG"
+
+        cv2.putText(
+            frame,
+            text,
+            (bx+20,by+43),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            color,
+            2
+        )
+
+        self.mode_button = (bx,by,bx+bw,by+button_h)
+
+    def check_slider(self,x,y):
+
+        if self.slider is None:
+            return
+
+        sx1,sy1,sx2,sy2 = self.slider
+
+        if sx1 < x < sx2 and sy1 < y < sy2:
+
+            ratio = (x - sx1)/(sx2 - sx1)
+
+            if self.linear_mode:
+                self.speed = ratio * self.max_speed
+            else:
+                self.angular_speed = ratio * self.max_angular
+
+    def draw_crosshair(self, frame, w, h):
+
+        cx = w//2
+        cy = h//2
+
+        cv2.line(frame,(cx-20,cy),(cx+20,cy),(255,255,255),2)
+        cv2.line(frame,(cx,cy-20),(cx,cy+20),(255,255,255),2)
+
+    def draw_gesture_panel(self, frame, gesture, w):
+
+        x1 = w - 300
+        x2 = w - 20
+        y1 = 10
+        y2 = 90
+
+        color = (0,0,255)
+
+        if gesture == "FORWARD":
+            color = (0,255,0)
+        elif gesture == "BACKWARD":
+            color = (0,125,255)
+        elif gesture == "LEFT":
+            color = (255,0,0)
+        elif gesture == "RIGHT":
+            color = (255,255,0)
+        elif gesture == "CW":
+            color = (255,0,255)
+        elif gesture == "CWW":
+            color = (255,0,255)
+
+        cv2.rectangle(frame,(x1,y1),(x2,y2),color,2)
+
+        font = cv2.FONT_HERSHEY_SIMPLEX
+
+        title = "GESTURE"
+        (tw,_),_ = cv2.getTextSize(title,font,0.6,2)
+        tx = x1 + (x2-x1-tw)//2
+
+        cv2.putText(frame,title,(tx,y1+30),font,0.6,color,2)
+
+        (gw,gh),_ = cv2.getTextSize(gesture,font,0.9,2)
+
+        gx = x1 + (x2-x1-gw)//2
+        gy = y1 + (y2-y1)//2 + gh//2 + 10
+
+        cv2.putText(frame,gesture,(gx,gy),font,0.9,color,2)
+
+    def draw_robot_indicator(self, frame, gesture, w):
+
+        cx = w - 80
+        cy = 150
+
+        cv2.circle(frame,(cx,cy),40,(255,255,255),2)
+
+        if gesture == "FORWARD":
+            cv2.arrowedLine(frame,(cx,cy+20),(cx,cy-30),(0,255,0),3)
+
+        elif gesture == "BACKWARD":
+            cv2.arrowedLine(frame,(cx,cy-20),(cx,cy+30),(0,125,255),3)
+
+        elif gesture == "LEFT":
+            cv2.arrowedLine(frame,(cx+20,cy),(cx-30,cy),(255,0,0),3)
+
+        elif gesture == "RIGHT":
+            cv2.arrowedLine(frame,(cx-20,cy),(cx+30,cy),(255,255,0),3)
+
+        elif gesture == "CW":
+            cv2.ellipse(frame,(cx,cy),(25,25),0,0,300,(255,0,255),3)
+            cv2.arrowedLine(frame,(cx+15,cy-20),(cx+30,cy-10),(255,0,255),3)
+
+        elif gesture == "CCW":
+            cv2.ellipse(frame,(cx,cy),(25,25),0,60,360,(255,0,255),3)
+            cv2.arrowedLine(frame,(cx-15,cy-20),(cx-30,cy-10),(255,0,255),3)
+
+    def loop(self):
+
+        ret, frame = self.cap.read()
+        if not ret:
+            return
+
+        frame = cv2.flip(frame,1)
+
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(rgb)
+
+        twist = Twist()
+
+        h, w, _ = frame.shape
+        mid = w//2
+
+        gesture_text = "STOP"
+
+        if result.multi_hand_landmarks:
+
+            for hand in result.multi_hand_landmarks:
+                # วาด skeleton ของมือ
+                self.mp_draw.draw_landmarks(
+                    frame,
+                    hand,
+                    self.mp_hands.HAND_CONNECTIONS,
+                    self.mp_draw.DrawingSpec(color=(0,255,0), thickness=2, circle_radius=3),
+                    self.mp_draw.DrawingSpec(color=(255,255,255), thickness=2)
+                )
+
+                lm = hand.landmark
+                hand_x = int(lm[0].x * w)
+
+                if hand_x < mid:
+
+                    index_x = int(lm[8].x * w)
+                    index_y = int(lm[8].y * h)
+
+                    cv2.circle(frame,(index_x,index_y),8,(0,255,0),-1)
+
+                    self.check_mode_toggle(index_x,index_y)
+                    self.check_slider(index_x,index_y)
+
+                else:
+
+                    gesture = self.detect_gesture(lm,w,h)
+                    stable = self.gesture_filter(gesture)
+
+                    if stable:
+
+                        gesture_text = stable
+
+                        if stable == "FORWARD":
+                            twist.linear.x = self.speed
+
+                        elif stable == "BACKWARD":
+                            twist.linear.x = -self.speed
+
+                        elif stable == "LEFT":
+                            twist.linear.y = self.speed
+
+                        elif stable == "RIGHT":
+                            twist.linear.y = -self.speed
+
+                        elif stable == "CW":
+                            twist.angular.z = -self.angular_speed
+
+                        elif stable == "CCW":
+                            twist.angular.z = self.angular_speed
+
+        self.publisher.publish(twist)
+
+        self.draw_slider(frame)
+        self.draw_gesture_panel(frame,gesture_text,w)
+        self.draw_robot_indicator(frame,gesture_text,w)
+
+        cv2.imshow("Gesture Robot Control",frame)
+        cv2.waitKey(1)
+
+
+def main(args=None):
+
+    rclpy.init(args=args)
+
+    node = GestureControl()
+
+    rclpy.spin(node)
+
+    node.destroy_node()
+
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
