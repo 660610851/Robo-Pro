@@ -1,0 +1,126 @@
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+import math
+
+WARN_DIST   = 0.150   # 150mm ?????????
+AVOID_DIST  = 0.120   # 120mm ???
+AVOID_SPEED = 0.12    # ???????????
+
+# LiDAR ????????????????????????? = angle ? ±? (index ???/????)
+# ???? offset 180 ???? ???????????????? = 0 ????
+ANGLE_OFFSET = math.pi
+
+class ObstacleDetection(Node):
+    def __init__(self):
+        super().__init__('obstacle_detection')
+
+        qos = QoSProfile(depth=10,
+                         reliability=ReliabilityPolicy.BEST_EFFORT)
+
+        self.sub_scan = self.create_subscription(
+            LaserScan, '/scan', self.scan_cb, qos)
+
+        self.pub_avoid = self.create_publisher(Twist, '/obstacle_cmd', 10)
+
+        self.last_warn_log = 0.0
+        self.warn_interval = 0.5
+
+        self.get_logger().info('Obstacle Detection node started')
+        self.get_logger().info(
+            f'WARN < {WARN_DIST*1000:.0f}mm | AVOID < {AVOID_DIST*1000:.0f}mm')
+
+    def scan_cb(self, msg: LaserScan):
+        ranges = msg.ranges
+        if not ranges:
+            return
+
+        warnings = []
+        avoid_vectors = []
+
+        for i, r in enumerate(ranges):
+            if math.isnan(r) or math.isinf(r) or r <= 0.01 or r > 1.0:
+                continue
+
+            # angle ??? LiDAR
+            raw_angle = msg.angle_min + i * msg.angle_increment
+
+            # ??????????????? = 0 (offset ?)
+            front_angle = raw_angle + ANGLE_OFFSET
+            # normalize ????????? -? ??? ?
+            front_angle = math.atan2(math.sin(front_angle), math.cos(front_angle))
+
+            # ???????????? CW ???????????? (????=0, ???=90, ????=180, ????=270)
+            angle_cw = (-math.degrees(front_angle)) % 360
+
+            if r < WARN_DIST:
+                warnings.append((angle_cw, r))
+            if r < AVOID_DIST:
+                avoid_vectors.append((front_angle, r))
+
+        # ===== ????????? =====
+        now = self.get_clock().now().nanoseconds / 1e9
+        if warnings and (now - self.last_warn_log) > self.warn_interval:
+            for angle_cw, dist in sorted(warnings, key=lambda x: x[1]):
+                level = '[DANGER]' if dist < AVOID_DIST else '[WARN]  '
+                self.get_logger().warn(
+                    f'{level} {angle_cw:5.1f} deg | {dist*1000:.1f} mm')
+            self.last_warn_log = now
+
+        # ===== ??? =====
+        if avoid_vectors:
+            twist = self.calc_avoid(avoid_vectors)
+            self.pub_avoid.publish(twist)
+            self.get_logger().error(
+                f'[AVOID] {len(avoid_vectors)} ??? '
+                f'lx={twist.linear.x:+.2f} ly={twist.linear.y:+.2f}')
+
+    def calc_avoid(self, avoid_vectors):
+        """
+        front_angle: ????????=0, ????=+?/2, ???=-?/2, ????=±?
+        ROS frame: ????=+x, ????=+y
+        """
+        sum_x, sum_y = 0.0, 0.0
+
+        for front_angle, dist in avoid_vectors:
+            weight = 1.0 / max(dist, 0.01)
+            vx = math.cos(front_angle) * weight
+            vy = math.sin(front_angle) * weight
+            sum_x += vx
+            sum_y += vy
+
+        total = math.sqrt(sum_x**2 + sum_y**2)
+        twist = Twist()
+
+        if total > 0:
+            nx = sum_x / total  # +1 = ?????????????, -1 = ????????
+            ny = sum_y / total  # +1 = ?????????????, -1 = ???????
+
+            # ????????????? ? ???????
+            if nx > 0.3:
+                twist.linear.x = -AVOID_SPEED
+                twist.linear.y = -ny * AVOID_SPEED * 0.5
+            # ????????????? ? ????????
+            elif nx < -0.3:
+                twist.linear.x = AVOID_SPEED
+                twist.linear.y = -ny * AVOID_SPEED * 0.5
+            # ????????????? ? ?????????
+            else:
+                twist.linear.x = -nx * AVOID_SPEED
+                twist.linear.y = -ny * AVOID_SPEED
+
+        return twist
+
+
+def main():
+    rclpy.init()
+    node = ObstacleDetection()
+    rclpy.spin(node)
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
