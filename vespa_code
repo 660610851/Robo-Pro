@@ -1,0 +1,262 @@
+import rclpy
+from rclpy.node import Node
+
+from sensor_msgs.msg import LaserScan
+from geometry_msgs.msg import Twist
+
+from rclpy.qos import QoSProfile, ReliabilityPolicy
+
+import math
+import time
+
+
+# =============================
+# PARAMETERS
+# =============================
+
+WARN_DIST = 0.15
+AVOID_DIST = 0.20
+
+AVOID_SPEED = 0.15
+MIN_SPEED = 0.06
+
+ANGLE_OFFSET = math.pi
+
+MAX_RANGE = 1.5
+FRONT_SECTOR = math.radians(120)
+
+SMOOTH_ALPHA = 0.85
+
+CMD_INTERVAL = 0.10
+WARN_INTERVAL = 0.5
+
+CLEAR_TIME = 0.5
+
+
+# =============================
+# NODE
+# =============================
+
+class ObstacleDetection(Node):
+
+    def __init__(self):
+
+        super().__init__('obstacle_detection')
+
+        qos = QoSProfile(
+            depth=10,
+            reliability=ReliabilityPolicy.BEST_EFFORT
+        )
+
+        self.sub_scan = self.create_subscription(
+            LaserScan,
+            '/scan',
+            self.scan_cb,
+            qos
+        )
+
+        self.pub_cmd = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            10
+        )
+
+        self.prev_vx = 0.0
+        self.prev_vy = 0.0
+
+        self.last_cmd_time = 0.0
+        self.last_warn_log = 0.0
+
+        self.last_obstacle_time = 0.0
+
+        self.avoiding = False
+
+        self.get_logger().info("Obstacle detection started")
+
+
+# =====================================
+# SCAN CALLBACK
+# =====================================
+
+    def scan_cb(self, msg: LaserScan):
+
+        ranges = msg.ranges
+
+        if not ranges:
+            return
+
+        warnings = []
+        avoid_vectors = []
+
+        for i, r in enumerate(ranges):
+
+            if math.isnan(r) or math.isinf(r):
+                continue
+
+            if r <= 0.02 or r > MAX_RANGE:
+                continue
+
+            raw_angle = msg.angle_min + i * msg.angle_increment
+
+            front_angle = raw_angle + ANGLE_OFFSET
+
+            front_angle = math.atan2(
+                math.sin(front_angle),
+                math.cos(front_angle)
+            )
+
+            # ignore lidar behind robot
+            if abs(front_angle) > FRONT_SECTOR:
+                continue
+
+            angle_deg = (-math.degrees(front_angle)) % 360
+
+            if r < WARN_DIST:
+                warnings.append((angle_deg, r))
+
+            if r < AVOID_DIST:
+                avoid_vectors.append((front_angle, r))
+
+
+        now = time.time()
+
+# =====================================
+# WARNING LOG
+# =====================================
+
+        if warnings and (now - self.last_warn_log) > WARN_INTERVAL:
+
+            nearest = min(warnings, key=lambda x: x[1])
+
+            level = "[DANGER]" if nearest[1] < AVOID_DIST else "[WARN]"
+
+            self.get_logger().warn(
+                f"{level} {nearest[0]:5.1f} deg | {nearest[1]*1000:.1f} mm"
+            )
+
+            self.last_warn_log = now
+
+
+# =====================================
+# STATE MACHINE
+# =====================================
+
+        nearest_dist = min([r for _, r in warnings], default=10)
+
+        if nearest_dist < AVOID_DIST:
+
+            self.avoiding = True
+            self.last_obstacle_time = now
+
+
+        if self.avoiding:
+
+            if now - self.last_obstacle_time > CLEAR_TIME:
+
+                self.avoiding = False
+                self.get_logger().info("[CLEAR] obstacle cleared")
+
+
+# =====================================
+# AVOIDANCE
+# =====================================
+
+        if self.avoiding and avoid_vectors:
+
+            twist = self.calc_avoid(avoid_vectors)
+
+            if now - self.last_cmd_time > CMD_INTERVAL:
+
+                self.pub_cmd.publish(twist)
+
+                self.get_logger().info(
+                    f"[AVOID] vx={twist.linear.x:+.2f} vy={twist.linear.y:+.2f}"
+                )
+
+                self.last_cmd_time = now
+
+
+# =====================================
+# AVOIDANCE CALCULATION
+# =====================================
+
+    def calc_avoid(self, avoid_vectors):
+
+        sum_x = 0.0
+        sum_y = 0.0
+
+        for angle, dist in avoid_vectors:
+
+            weight = (AVOID_DIST - dist) / AVOID_DIST
+            weight = max(weight, 0.0)
+
+            # stronger repulsive force
+            weight = weight ** 2
+
+            vx = math.cos(angle) * weight
+            vy = math.sin(angle) * weight
+
+            sum_x += vx
+            sum_y += vy
+
+
+        mag = math.sqrt(sum_x**2 + sum_y**2)
+
+        twist = Twist()
+
+        if mag == 0:
+            return twist
+
+
+        nx = sum_x / mag
+        ny = sum_y / mag
+
+
+        vx = -nx * AVOID_SPEED
+        vy = -ny * AVOID_SPEED
+
+
+# ===== smoothing =====
+
+        vx = SMOOTH_ALPHA * self.prev_vx + (1 - SMOOTH_ALPHA) * vx
+        vy = SMOOTH_ALPHA * self.prev_vy + (1 - SMOOTH_ALPHA) * vy
+
+
+# ===== minimum speed =====
+
+        if abs(vx) < MIN_SPEED and vx != 0:
+            vx = math.copysign(MIN_SPEED, vx)
+
+        if abs(vy) < MIN_SPEED and vy != 0:
+            vy = math.copysign(MIN_SPEED, vy)
+
+
+        self.prev_vx = vx
+        self.prev_vy = vy
+
+
+        twist.linear.x = vx
+        twist.linear.y = vy
+
+        return twist
+
+
+# =====================================
+# MAIN
+# =====================================
+
+def main():
+
+    rclpy.init()
+
+    node = ObstacleDetection()
+
+    rclpy.spin(node)
+
+    node.destroy_node()
+
+    rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
