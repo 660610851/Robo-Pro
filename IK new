@@ -1,271 +1,444 @@
-import serial
-import time
 import math
 import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
+import threading
+import queue
 
-# =============================
-# SERIAL
-# =============================
-ser = serial.Serial('/dev/ttyUSB0', 115200, timeout=1)
-time.sleep(2)
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy  # ← เพิ่ม
+from std_msgs.msg import String, Bool, Int32
+from geometry_msgs.msg import Point
 
-# =============================
-# DH PARAMETERS
-# =============================
-L0 = 0.028   # base offset  z0 → z1
-L1 = 0.22    # link 1       z1 → z2
-L2 = 0.20    # link 2       z2 → z3
 
-# =============================
-# SERVO CONSTANTS
-# =============================
-BASE  = 355
+L0 = 0.028
+L1 = 0.22
+L2 = 0.20
+
+ESP_MIN = 100
+ESP_MAX = 600
+
+BASE_DEFAULT  = 355
+BASE_ROTATED  = 180
 WRIST = 405
 HOLE  = 110
 GRIP  = 520
+HOLE_FLAT = 110
+HOLE_VERT = 350
 
-SERVO_MIN = 150
-SERVO_MAX = 600
-
-# =============================
-# WORKSPACE LIMITS
-# =============================
-MAX_REACH = L1 + L2   # 0.42 m
+MAX_REACH = L1 + L2 - 0.01
 MIN_REACH = 0.05
 
-# =============================
-# HOME / READY ANGLES
-# pulse → angle = (pulse - 150) / 450 * 180 - 90
-#
-# HOME  : shoulder pulse=200 → -70.0°,  elbow pulse=600 → +90.0°
-# READY : shoulder pulse=260 → -46.0°,  elbow pulse=530 → +62.0°
-# =============================
-HOME_SHOULDER_DEG  = -70.0
-HOME_ELBOW_DEG     =  90.0
+_theta    = np.linspace(0, 2 * math.pi, 400)
+wsx_outer = (L1 + L2) * np.cos(_theta)
+wsz_outer = L0 + (L1 + L2) * np.sin(_theta)
+wsx_inner = abs(L1 - L2) * np.cos(_theta)
+wsz_inner = L0 + abs(L1 - L2) * np.sin(_theta)
 
-READY_SHOULDER_DEG = -46.0
-READY_ELBOW_DEG    =  62.0
+SERVO_OFFSET = 395
+SERVO_SCALE  = 1.5
 
-# =============================
-# STATE
-# =============================
-home_origin_x = 0.0
-home_origin_z = 0.0
-
-current_x = 0.0
-current_z = 0.0
-
-print("Robot Arm Controller Ready")
-print(f"  L0={L0} m  L1={L1} m  L2={L2} m")
-
-# =============================
-# GRAPH INIT
-# =============================
-plt.ion()
-plt.figure(figsize=(7, 7))
-
-# =============================
-# HELPERS
-# =============================
-def pulse_to_angle(pulse):
-    """ESP pulse → joint angle (degrees)."""
-    return (pulse - SERVO_MIN) / (SERVO_MAX - SERVO_MIN) * 180.0 - 90.0
+def pulse_to_angle_deg(pulse):
+    return -(pulse - SERVO_OFFSET) / SERVO_SCALE
 
 def angle_to_pulse(angle_deg):
-    """Joint angle (degrees) → ESP pulse."""
-    pulse = int(SERVO_MIN + ((angle_deg + 90.0) / 180.0) * (SERVO_MAX - SERVO_MIN))
-    return max(SERVO_MIN, min(SERVO_MAX, pulse))
+    p = int(-angle_deg * SERVO_SCALE + SERVO_OFFSET)
+    return max(ESP_MIN, min(ESP_MAX, p))
 
-# =============================
-# FORWARD KINEMATICS
-# =============================
-def fk(shoulder_rad, elbow_rad):
-    x = L1 * math.cos(shoulder_rad) + L2 * math.cos(shoulder_rad + elbow_rad)
-    z = L0 + L1 * math.sin(shoulder_rad) + L2 * math.sin(shoulder_rad + elbow_rad)
+def fk(sh, el):
+    x = L1 * math.cos(sh) + L2 * math.cos(sh + el)
+    z = L0 + L1 * math.sin(sh) + L2 * math.sin(sh + el)
     return x, z
 
-# =============================
-# INVERSE KINEMATICS
-# =============================
 def ik(x_real, z_real):
     z_sh = z_real - L0
-    d = math.sqrt(x_real**2 + z_sh**2)
-
-    if d > MAX_REACH:
-        print(f"[IK] Out of reach: d={d:.4f} > MAX={MAX_REACH:.4f}")
+    d    = math.sqrt(x_real**2 + z_sh**2)
+    if d > MAX_REACH or d < MIN_REACH:
         return None
-    if d < MIN_REACH:
-        print(f"[IK] Too close: d={d:.4f} < MIN={MIN_REACH:.4f}")
-        return None
-
-    cos_elbow = (d**2 - L1**2 - L2**2) / (2 * L1 * L2)
-    cos_elbow = max(-1.0, min(1.0, cos_elbow))
-    elbow = -math.acos(cos_elbow)
-
-    k1 = L1 + L2 * math.cos(elbow)
-    k2 = L2 * math.sin(elbow)
+    cos_el = (d**2 - L1**2 - L2**2) / (2 * L1 * L2)
+    cos_el = max(-1.0, min(1.0, cos_el))
+    elbow  = -math.acos(cos_el)
+    k1     = L1 + L2 * math.cos(elbow)
+    k2     = L2 * math.sin(elbow)
     shoulder = math.atan2(z_sh, x_real) - math.atan2(k2, k1)
-
     return shoulder, elbow
 
-# =============================
-# COORDINATE CONVERSION
-# =============================
-def user_to_real(x_user, z_user):
-    return x_user + home_origin_x, z_user + home_origin_z
+# ── Thread-safe draw queue ──────────────────────────────────────
+_draw_queue = queue.Queue()
 
-def real_to_user(x_real, z_real):
-    return x_real - home_origin_x, z_real - home_origin_z
+def draw_all(note=""):
+    """Safe to call from ANY thread"""
+    _draw_queue.put(note)
 
-# =============================
-# DRAW ARM
-# =============================
-def plot_arm(shoulder_rad, elbow_rad):
-    x0, z0 = 0.0, L0
-    x1 = x0 + L1 * math.cos(shoulder_rad)
-    z1 = z0 + L1 * math.sin(shoulder_rad)
-    x2 = x1 + L2 * math.cos(shoulder_rad + elbow_rad)
-    z2 = z1 + L2 * math.sin(shoulder_rad + elbow_rad)
+def _flush_draw_queue():
+    """Call ONLY from main thread"""
+    try:
+        while True:
+            note = _draw_queue.get_nowait()
+            _draw_now(note)
+    except queue.Empty:
+        pass
 
-    x2_user, z2_user = real_to_user(x2, z2)
+# ── ROS2 Node ───────────────────────────────────────────────────
+class IKControllerNode(Node):
+    def __init__(self):
+        super().__init__('ik_controller')
 
-    plt.clf()
-    plt.plot([0, 0],   [0, L0], 'k-',  linewidth=3, label='Base')
-    plt.plot([x0, x1], [z0, z1], 'o-', linewidth=5, color='steelblue', label='Link1')
-    plt.plot([x1, x2], [z1, z2], 'o-', linewidth=5, color='tomato',    label='Link2')
-    plt.scatter(x2, z2, s=120, color='black', zorder=5)
-    plt.text(x2 + 0.015, z2 + 0.015,
-             f"user: x={x2_user:.3f}\n      z={z2_user:.3f}",
-             fontsize=9, bbox=dict(boxstyle='round,pad=0.3', facecolor='lightyellow', alpha=0.8))
-    plt.scatter(home_origin_x, home_origin_z, s=200, marker='*', color='gold', zorder=6, label='Home(0,0)')
-    plt.xlim(-0.50, 0.50)
-    plt.ylim(-0.20, 0.55)
-    plt.xlabel("X (m)")
-    plt.ylabel("Z (m)")
-    plt.title("Robot Arm — X-Z Plane")
-    plt.legend(loc='upper left', fontsize=8)
-    plt.grid(True, alpha=0.4)
-    plt.pause(0.001)
+        # ← QoS RELIABLE เพื่อให้ตรงกับ ESP32 (rclc_subscription_init_default)
+        reliable_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
 
-# =============================
-# SEND TO HARDWARE
-# =============================
-def send_arm(shoulder_rad, elbow_rad):
-    s = angle_to_pulse(math.degrees(shoulder_rad))
-    e = angle_to_pulse(math.degrees(elbow_rad))
-    cmd = f"ALL:{BASE},{s},{e},{WRIST},{GRIP},{HOLE}\n"
-    ser.write(cmd.encode())
-    print(f"  → {cmd.strip()}")
+        self.arm_cmd_pub   = self.create_publisher(String, '/arm_cmd',   reliable_qos)  # ← แก้
+        self.arm_state_pub = self.create_publisher(Point,  '/arm_state', 10)
+        self.create_subscription(Point,  '/target_pose',  self.cb_target_pose,  10)
+        self.create_subscription(String, '/arm_feedback', self.cb_arm_feedback, 10)
+        self.create_subscription(Bool,   '/gripper_cmd',  self.cb_gripper,      10)
+        self.create_subscription(Bool,   '/pump_cmd',     self.cb_pump,         10)
+        self.get_logger().info('IK Controller Node started')
+        self.get_logger().info('Subscribing: /target_pose, /arm_feedback, /gripper_cmd, /pump_cmd')
+        self.get_logger().info('Publishing : /arm_cmd, /arm_state')
 
-# =============================
-# HOME
-# =============================
+    def cb_target_pose(self, msg):
+        self.get_logger().info(f'[/target_pose] x={msg.x:.3f}  z={msg.z:.3f}')
+        move_to(msg.x, msg.z)
+
+    def cb_arm_feedback(self, msg):
+        self.get_logger().info(f'[/arm_feedback] {msg.data}')
+
+    def cb_gripper(self, msg):
+        gripper_open() if msg.data else gripper_close()
+
+    def cb_pump(self, msg):
+        global pump_on
+        pump_on = msg.data
+        _publish_cmd("PUMP:ON" if pump_on else "PUMP:OFF")
+        draw_all()
+
+    def publish_arm_cmd(self, cmd_str):
+        msg = String(); msg.data = cmd_str
+        self.arm_cmd_pub.publish(msg)
+        self.get_logger().info(f'[/arm_cmd] -> {cmd_str}')
+
+    def publish_arm_state(self, x, z):
+        msg = Point(); msg.x = x; msg.y = 0.0; msg.z = z
+        self.arm_state_pub.publish(msg)
+
+_node = None
+
+def _publish_cmd(cmd_str):
+    if _node:
+        _node.publish_arm_cmd(cmd_str)
+
+# ── State ───────────────────────────────────────────────────────
+home_origin_x = 0.0
+home_origin_z = 0.0
+current_x     = 0.0
+current_z     = 0.0
+typed_text    = ""
+arm_speed     = 30
+grip_open     = True
+pump_on       = False
+hole_vertical = False
+base_rotated  = False
+current_sh         = math.radians(pulse_to_angle_deg(200))
+current_el         = math.radians(pulse_to_angle_deg(600))
+current_base_pulse = BASE_DEFAULT
+
+def user_to_real(x, z): return x + home_origin_x, z + home_origin_z
+def real_to_user(x, z): return x - home_origin_x, z - home_origin_z
+
+def send_arm(sh, el):
+    global current_sh, current_el
+    current_sh = sh; current_el = el
+    s = angle_to_pulse(math.degrees(sh))
+    e = angle_to_pulse(math.degrees(el))
+    _publish_cmd(f"SPEED:{arm_speed}")
+    cmd = f"ALL:{current_base_pulse},{s},{e},{WRIST},{GRIP},{HOLE}"
+    _publish_cmd(cmd)
+    rx, rz = fk(sh, el)
+    if _node: _node.publish_arm_state(rx, rz)
+    print(f"  -> SPEED:{arm_speed}  {cmd}")
+
+def gripper_open():
+    global grip_open
+    grip_open = True
+    _publish_cmd(f"SPEED:{arm_speed}"); _publish_cmd("GRIP:OPEN")
+    print("  Gripper -> OPEN"); draw_all()
+
+def gripper_close():
+    global grip_open
+    grip_open = False
+    _publish_cmd(f"SPEED:{arm_speed}"); _publish_cmd("GRIP:CLOSE")
+    print("  Gripper -> CLOSE"); draw_all()
+
+def gripper_toggle():
+    gripper_close() if grip_open else gripper_open()
+
+def pump_toggle():
+    global pump_on
+    pump_on = not pump_on
+    _publish_cmd("PUMP:ON" if pump_on else "PUMP:OFF")
+    print(f"  Pump -> {'ON' if pump_on else 'OFF'}"); draw_all()
+
+def hole_toggle():
+    global hole_vertical
+    hole_vertical = not hole_vertical
+    pulse = HOLE_VERT if hole_vertical else HOLE_FLAT
+    _publish_cmd(f"SPEED:{arm_speed}"); _publish_cmd(f"SERVO:5:{pulse}")
+    print(f"  Hole -> {'Vertical' if hole_vertical else 'Flat'} ({pulse})"); draw_all()
+
+def base_toggle():
+    global base_rotated, current_base_pulse
+    base_rotated = not base_rotated
+    pulse = BASE_ROTATED if base_rotated else BASE_DEFAULT
+    current_base_pulse = pulse
+    _publish_cmd(f"SPEED:{arm_speed}"); _publish_cmd(f"SERVO:0:{pulse}")
+    print(f"  Base -> {'Rotated' if base_rotated else 'Normal'} ({pulse})"); draw_all()
+
 def home():
     global home_origin_x, home_origin_z, current_x, current_z
-
-    ser.write(b"ALL:355,200,600,405,520,110\n")
-    time.sleep(0.5)
-
-    sh = math.radians(HOME_SHOULDER_DEG)
-    el = math.radians(HOME_ELBOW_DEG)
-
+    global current_sh, current_el, current_base_pulse
+    _publish_cmd("ALL:355,200,600,405,520,110")
+    current_base_pulse = BASE_DEFAULT
+    sh = math.radians(pulse_to_angle_deg(200))
+    el = math.radians(pulse_to_angle_deg(600))
+    current_sh, current_el = sh, el
     real_x, real_z = fk(sh, el)
-    home_origin_x = real_x
-    home_origin_z = real_z
-    current_x = 0.0
-    current_z = 0.0
+    home_origin_x, home_origin_z = real_x, real_z
+    current_x, current_z = 0.0, 0.0
+    draw_all("HOME")
+    print(f"HOME  real({real_x:.4f},{real_z:.4f})")
 
-    plot_arm(sh, el)
-
-    print("=" * 40)
-    print(f"HOME SET  shoulder={HOME_SHOULDER_DEG}°  elbow={HOME_ELBOW_DEG}°")
-    print(f"  Real: x={real_x:.4f}  z={real_z:.4f}")
-    print(f"  User: x=0.000  z=0.000")
-    print("=" * 40)
-
-# =============================
-# READY
-# =============================
-def ready():
-    global current_x, current_z
-
-    # ส่ง pulse ตรงๆ เหมือน ESP — ครั้งเดียว ไม่ซ้ำ
-    ser.write(b"ALL:355,260,530,405,520,110\n")
-    time.sleep(0.5)
-
-    sh = math.radians(READY_SHOULDER_DEG)
-    el = math.radians(READY_ELBOW_DEG)
-
+def ready(set_origin=False):
+    global current_x, current_z, current_sh, current_el
+    global home_origin_x, home_origin_z
+    _publish_cmd("ALL:355,260,530,405,520,110")
+    sh = math.radians(pulse_to_angle_deg(260))
+    el = math.radians(pulse_to_angle_deg(530))
+    current_sh, current_el = sh, el
     real_x, real_z = fk(sh, el)
-    current_x, current_z = real_to_user(real_x, real_z)
+    if set_origin:
+        home_origin_x, home_origin_z = real_x, real_z
+        current_x, current_z = 0.0, 0.0
+        print("READY -> SET AS ORIGIN (0,0)")
+    else:
+        current_x, current_z = real_to_user(real_x, real_z)
+    draw_all("READY" + (" <- origin" if set_origin else ""))
 
-    plot_arm(sh, el)
-
-    print("READY POSITION")
-    print(f"  Real: x={real_x:.3f}  z={real_z:.3f}")
-    print(f"  User: x={current_x:.3f}  z={current_z:.3f}")
-
-# =============================
-# SMOOTH MOTION
-# =============================
-def move_to(x_user, z_user, steps=40):
+def move_to(x_user, z_user):
     global current_x, current_z
+    rx, rz = user_to_real(x_user, z_user)
+    res = ik(rx, rz)
+    if res is None:
+        print(f"[IK] Out of reach  user=({x_user:.3f},{z_user:.3f})"); return
+    sh, el = res; send_arm(sh, el)
+    rx2, rz2 = fk(sh, el)
+    current_x, current_z = real_to_user(rx2, rz2)
+    draw_all()
+    print(f"Arrived -> user x={current_x:.3f}  z={current_z:.3f}")
 
-    xs = np.linspace(current_x, x_user, steps)
-    zs = np.linspace(current_z, z_user, steps)
-
-    for i in range(steps):
-        rx, rz = user_to_real(xs[i], zs[i])
-        result = ik(rx, rz)
-        if result is None:
-            print(f"[move_to] IK failed at step {i}  user=({xs[i]:.3f},{zs[i]:.3f})  real=({rx:.3f},{rz:.3f})")
-            return
-        shoulder, elbow = result
-        send_arm(shoulder, elbow)
-        plot_arm(shoulder, elbow)
-        time.sleep(0.03)
-
-    current_x = x_user
-    current_z = z_user
-    print(f"Arrived → user x={current_x:.3f}  z={current_z:.3f}")
-
-# =============================
-# SHOW POSITION
-# =============================
 def show_pos():
-    real_x, real_z = user_to_real(current_x, current_z)
+    rx, rz = user_to_real(current_x, current_z)
     print(f"  User : x={current_x:.4f}  z={current_z:.4f}")
-    print(f"  Real : x={real_x:.4f}  z={real_z:.4f}")
-    print(f"  Home : x={home_origin_x:.4f}  z={home_origin_z:.4f}  (real world)")
+    print(f"  Real : x={rx:.4f}  z={rz:.4f}")
+    print(f"  Speed: {arm_speed}  Grip: {'OPEN' if grip_open else 'CLOSE'}  Pump: {'ON' if pump_on else 'OFF'}")
 
-# =============================
-# MAIN LOOP
-# =============================
-print("\nCommands:")
-print("  home   → go to home, set as (0,0)")
-print("  ready  → move to ready pose")
-print("  pos    → show current position")
-print("  x z    → move to user coordinates  e.g. 0.1 0.05")
-print("  q      → quit")
+# ── Figures ─────────────────────────────────────────────────────
+fig1 = plt.figure("Front View (X-Z)", figsize=(7, 8))
+ax        = fig1.add_axes([0.10, 0.18, 0.85, 0.78])
+ax_slider = fig1.add_axes([0.15, 0.06, 0.70, 0.04])
+fig2, ax2 = plt.subplots(figsize=(5, 5))
+fig2.canvas.manager.set_window_title("Side View (Y-Z)")
+fig3, ax3 = plt.subplots(figsize=(5, 5))
+fig3.canvas.manager.set_window_title("Top View (X-Y)")
 
-while True:
-    cmd = input("\n>> ").strip()
+speed_slider = Slider(ax=ax_slider, label='Speed', valmin=5, valmax=80,
+                      valinit=arm_speed, valstep=1, color='steelblue')
 
+def on_speed_change(val):
+    global arm_speed
+    arm_speed = int(speed_slider.val)
+
+speed_slider.on_changed(on_speed_change)
+
+def set_speed(steps):
+    global arm_speed
+    arm_speed = max(5, min(80, steps))
+    speed_slider.set_val(arm_speed)
+    draw_all()
+
+def _draw_now(note=""):
+    try:
+        _draw_front(note); _draw_side(); _draw_top()
+    except Exception as e:
+        print(f"[draw error] {e}")
+
+def _draw_front(note=""):
+    ax.clear()
+    sh, el = current_sh, current_el
+    x0, z0 = 0.0, L0
+    x1 = x0 + L1*math.cos(sh);  z1 = z0 + L1*math.sin(sh)
+    x2 = x1 + L2*math.cos(sh+el); z2 = z1 + L2*math.sin(sh+el)
+    xu, zu = real_to_user(x2, z2)
+    ax.plot(wsx_outer, wsz_outer, 'g--', lw=1, alpha=0.4, label='Workspace')
+    ax.plot(wsx_inner, wsz_inner, 'g--', lw=1, alpha=0.4)
+    ax.plot([0,0],[0,L0],'k-',lw=4,label='Base')
+    ax.plot([x0,x1],[z0,z1],'o-',lw=5,color='steelblue',label=f'Link1 {L1}m')
+    ax.plot([x1,x2],[z1,z2],'o-',lw=5,color='tomato',label=f'Link2 {L2}m')
+    ax.scatter(x2,z2,s=150,color='black',zorder=5)
+    ax.scatter(0,0,s=120,color='dimgray',marker='s',zorder=7,label='Base(0,0)')
+    if home_origin_x!=0.0 or home_origin_z!=0.0:
+        ax.scatter(home_origin_x,home_origin_z,s=250,marker='*',color='gold',zorder=6,label='Origin')
+    ax.text(x2+0.015,z2+0.015,
+            f"EE real ({x2:.3f},{z2:.3f})\nuser ({xu:.3f},{zu:.3f})",
+            fontsize=8,bbox=dict(boxstyle='round,pad=0.3',facecolor='lightyellow',alpha=0.9))
+    sl = 'Fast' if arm_speed<20 else 'Mid' if arm_speed<50 else 'Slow'
+    ax.text(-0.45,0.48,
+            f"Shoulder={math.degrees(sh):.1f}\n"
+            f"Elbow   ={math.degrees(el):.1f}\n"
+            f"Speed   ={arm_speed} ({sl})\n"
+            f"Gripper ={'OPEN ' if grip_open else 'CLOSE'}  [G]\n"
+            f"Pump    ={'ON  ' if pump_on else 'OFF '}  [P]\n"
+            f"Hole    ={'Vertical' if hole_vertical else 'Flat    '}  [T]\n"
+            f"Base    ={'Rotated' if base_rotated else 'Normal '}  [B]\n"
+            f"ROS2    =Active",
+            fontsize=9,bbox=dict(facecolor='white',alpha=0.85),family='monospace')
+    ax.text(-0.45,0.20,f"Input: {typed_text}_",fontsize=9,
+            bbox=dict(facecolor='lightyellow',alpha=0.8))
+    ax.set_xlim(-0.50,0.55); ax.set_ylim(-0.15,0.55)
+    ax.set_xlabel("X (m)"); ax.set_ylabel("Z (m)")
+    ax.set_title(f"Front View  {note}\nx,z->ENTER | G P T B | home/ready/ready0/q")
+    ax.legend(loc='upper right',fontsize=7); ax.grid(True,alpha=0.4)
+    fig1.canvas.draw(); fig1.canvas.flush_events()
+
+def _draw_side():
+    ax2.clear()
+    sh,el = current_sh,current_el
+    bd = math.radians(pulse_to_angle_deg(current_base_pulse))
+    r1=L1*math.cos(sh); r2=r1+L2*math.cos(sh+el)
+    z0=L0; z1=z0+L1*math.sin(sh); z2=z1+L2*math.sin(sh+el)
+    y1=r1*math.sin(bd); y2=r2*math.sin(bd)
+    ax2.plot([0,0],[0,L0],'k-',lw=4,label='Base')
+    ax2.plot([0,y1],[z0,z1],'o-',lw=5,color='steelblue',label='Link1')
+    ax2.plot([y1,y2],[z1,z2],'o-',lw=5,color='tomato',label='Link2')
+    ax2.scatter(y2,z2,s=150,color='black',zorder=5)
+    ax2.set_xlim(-0.50,0.50); ax2.set_ylim(-0.15,0.55)
+    ax2.set_xlabel("Y (m)"); ax2.set_ylabel("Z (m)")
+    ax2.set_title(f"Side View  Base={pulse_to_angle_deg(current_base_pulse):.1f}")
+    ax2.legend(loc='upper right',fontsize=7); ax2.grid(True,alpha=0.4)
+    fig2.canvas.draw(); fig2.canvas.flush_events()
+
+def _draw_top():
+    ax3.clear()
+    sh,el = current_sh,current_el
+    bd = math.radians(pulse_to_angle_deg(current_base_pulse))
+    r1=L1*math.cos(sh); r2=r1+L2*math.cos(sh+el)
+    x1=r1*math.cos(bd); y1=r1*math.sin(bd)
+    x2=r2*math.cos(bd); y2=r2*math.sin(bd)
+    _t=np.linspace(0,2*math.pi,400)
+    ax3.plot((L1+L2)*np.cos(_t),(L1+L2)*np.sin(_t),'g--',alpha=0.4)
+    ax3.plot(abs(L1-L2)*np.cos(_t),abs(L1-L2)*np.sin(_t),'g--',alpha=0.4)
+    ax3.plot([0,x1],[0,y1],'o-',lw=5,color='steelblue',label='Link1')
+    ax3.plot([x1,x2],[y1,y2],'o-',lw=5,color='tomato',label='Link2')
+    ax3.scatter(x2,y2,s=150,color='black',zorder=5)
+    ax3.scatter(0,0,s=120,color='dimgray',marker='s',zorder=7)
+    bx=0.08*math.cos(bd); by=0.08*math.sin(bd)
+    ax3.annotate('',xy=(bx,by),xytext=(0,0),
+                 arrowprops=dict(arrowstyle='->',color='purple',lw=2))
+    ax3.text(x2+0.01,y2+0.01,f"EE({x2:.2f},{y2:.2f})",fontsize=7)
+    ax3.set_xlim(-0.50,0.50); ax3.set_ylim(-0.50,0.50)
+    ax3.set_xlabel("X (m)"); ax3.set_ylabel("Y (m)")
+    ax3.set_title(f"Top View  Base={pulse_to_angle_deg(current_base_pulse):.1f}")
+    ax3.legend(loc='upper right',fontsize=7); ax3.grid(True,alpha=0.4); ax3.set_aspect('equal')
+    fig3.canvas.draw(); fig3.canvas.flush_events()
+
+def on_key(event):
+    global typed_text
+    if event.key == 'g' and typed_text == "": gripper_toggle(); return
+    if event.key == 'p' and typed_text == "": pump_toggle(); return
+    if event.key == 't' and typed_text == "": hole_toggle(); return
+    if event.key == 'b' and typed_text == "": base_toggle(); return
+    if event.key == 'escape':
+        typed_text = ""; draw_all()
+    elif event.key == 'backspace':
+        typed_text = typed_text[:-1]; draw_all()
+    elif event.key == 'enter':
+        cmd = typed_text.strip(); typed_text = ""
+        print(f"\n[graph] >> {cmd}"); _handle_cmd(cmd)
+    elif event.key and len(event.key) == 1:
+        typed_text += event.key; draw_all()
+
+fig1.canvas.mpl_connect('key_press_event', on_key)
+fig2.canvas.mpl_connect('key_press_event', on_key)
+fig3.canvas.mpl_connect('key_press_event', on_key)
+
+def _handle_cmd(cmd):
     if cmd == "q":
-        break
-    elif cmd == "home":
-        home()
-    elif cmd == "ready":
-        ready()
-    elif cmd == "pos":
-        show_pos()
+        rclpy.shutdown(); plt.close('all'); print("Shutdown."); return
+    elif cmd == "home":           home()
+    elif cmd == "ready":          ready()
+    elif cmd == "ready0":         ready(set_origin=True)
+    elif cmd == "pos":            show_pos()
+    elif cmd in ("g","grip"):     gripper_toggle()
+    elif cmd == "grip open":      gripper_open()
+    elif cmd == "grip close":     gripper_close()
+    elif cmd in ("p","pump"):     pump_toggle()
+    elif cmd in ("t","hole"):     hole_toggle()
+    elif cmd in ("b","base"):     base_toggle()
+    elif cmd.lower().startswith("servo"):
+        try:
+            c = cmd.split(":",1)[1] if ":" in cmd else cmd.split(" ",1)[1]
+            parts = c.replace(","," ").split()
+            idx,val = int(parts[0]),int(parts[1])
+            _publish_cmd(f"SERVO:{idx}:{val}")
+            print(f"  SERVO:{idx} -> {val}")
+        except: print("format: servo <idx> <pulse>")
+    elif cmd.startswith("speed ") or cmd.startswith("spd "):
+        try: set_speed(int(cmd.split()[1]))
+        except: print("format: speed <5-80>")
     else:
         try:
-            x, z = map(float, cmd.split())
-            move_to(x, z)
-        except ValueError:
-            print("Invalid input. Enter: x z  (e.g. 0.1 0.0)")
+            parts = cmd.replace(","," ").split()
+            move_to(float(parts[0]), float(parts[1]))
+        except: print(f"Invalid: '{cmd}'")
 
-ser.close()
-print("Serial closed.")
+def main():
+    global _node
+    rclpy.init()
+    _node = IKControllerNode()
+    threading.Thread(target=rclpy.spin, args=(_node,), daemon=True).start()
+
+    print("="*50)
+    print("IK Controller  L0={} L1={} L2={}".format(L0,L1,L2))
+    print("PUB /arm_cmd -> ESP32  |  SUB /target_pose <- path_planning")
+    print("Keys: G=Gripper P=Pump T=Hole B=Base")
+    print("Cmds: home/ready/ready0/pos/speed N/x z/q")
+    print("="*50)
+
+    home()
+    plt.show(block=False)
+    _flush_draw_queue()
+
+    import select, sys
+    while any(plt.fignum_exists(f.number) for f in [fig1,fig2,fig3]):
+        _flush_draw_queue()
+        plt.pause(0.05)
+        if select.select([sys.stdin],[],[],0)[0]:
+            try:
+                cmd = sys.stdin.readline().strip()
+                if cmd:
+                    print(f">> {cmd}")
+                    _handle_cmd(cmd)
+                    if cmd == "q": break
+            except (KeyboardInterrupt, EOFError):
+                break
+
+    if _node: _node.destroy_node()
+    rclpy.shutdown()
+    plt.close('all')
+    print("Shutdown complete.")
+
+if __name__ == '__main__':
+    main()
