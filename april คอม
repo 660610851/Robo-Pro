@@ -1,9 +1,9 @@
 import cv2
 import numpy as np
+from pupil_apriltags import Detector
 import threading
 import time
-
-from pupil_apriltags import Detector
+import os
 
 import rclpy
 from rclpy.node import Node
@@ -11,39 +11,79 @@ from rclpy.node import Node
 from geometry_msgs.msg import Point
 from std_msgs.msg import Int32, Bool, Float32, String
 
+CENTER_THRESH = 40   # px — ต้องตรงกับ sequence_controller
+
 # =========================
-# CONFIG
+# STREAM FROM PI
 # =========================
-PORT = 5000
-CENTER_THRESH = 40   # px
+
+PI_IP = "pingg.local"
+STREAM_URL = f"http://{PI_IP}:5000/stream"
+
+# ✅ ลด latency ของ OpenCV HTTP reader
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;3000000"
+
+# =========================
+# CAMERA PARAMETER
+# =========================
 
 TAG_SIZE = 0.07
 CALIB_DISTANCE_M = 1.55
 FOCAL_LENGTH = None
 FOCAL_LENGTH_FILE = "focal_length.txt"
 
-FILTER_SIZE = 5
+# =========================
+# DISTANCE FILTER
+# =========================
+
 dist_history = []
+FILTER_SIZE = 5
 
 # =========================
-# GStreamer receiver pipeline
+# FRESH FRAME READER (ไม่มี sleep — วิ่งเต็มความเร็ว)
 # =========================
-GST_PIPELINE = (
-    f'udpsrc port={PORT} caps="application/x-rtp, media=video, encoding-name=H264, payload=96" ! '
-    'rtpjitterbuffer latency=0 drop-on-late=true ! '
-    'rtph264depay ! h264parse ! avdec_h264 ! '
-    'videoconvert ! video/x-raw,format=BGR ! '
-    'appsink drop=true max-buffers=1 sync=false'
-)
+
+class FreshFrame:
+
+    def __init__(self, url):
+        self.cap = cv2.VideoCapture(url)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.has_frame = False
+        self.running = True
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
+
+    def _update(self):
+        """✅ ไม่มี sleep — อ่าน frame เต็มความเร็ว ลด latency สูงสุด"""
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self.lock:
+                    self.latest_frame = frame
+                    self.has_frame = True
+            # ไม่มี time.sleep() — ให้ block อยู่ที่ cap.read() เองตาม FPS
+
+    def read(self):
+        with self.lock:
+            if not self.has_frame:
+                return False, None
+            return True, self.latest_frame.copy()
+
+    def release(self):
+        self.running = False
+        self.cap.release()
 
 # =========================
 # APRILTAG DETECTOR
 # =========================
+
 at_detector = Detector(
     families="tagStandard52h13",
     nthreads=4,
-    quad_decimate=2.0,
-    quad_sigma=0.0,
+    quad_decimate=2.0,      # ✅ เพิ่มจาก 1.5 → 2.0 เบา CPU ~30% ระยะใกล้ไม่กระทบ
+    quad_sigma=0.8,
     refine_edges=1,
     decode_sharpening=0.25
 )
@@ -51,13 +91,15 @@ at_detector = Detector(
 # =========================
 # TAG LOCK SYSTEM
 # =========================
+
 target_tag = None
 lost_count = 0
-MAX_LOST = 15
+MAX_LOST = 30
 
 # =========================
 # HELPERS
 # =========================
+
 def decode_tagid_5digits(tag_id):
     tag_str = f"{tag_id:05d}"
     planting_distance = int(tag_str[0:2])
@@ -73,9 +115,13 @@ def tag_area(tag):
 
 def tag_avg_pixels(tag):
     corners = tag.corners
-    width = np.linalg.norm(corners[0] - corners[1])
+    width  = np.linalg.norm(corners[0] - corners[1])
     height = np.linalg.norm(corners[1] - corners[2])
     return (width + height) / 2.0
+
+# =========================
+# FOCAL LENGTH SAVE/LOAD
+# =========================
 
 def save_focal(fl):
     with open(FOCAL_LENGTH_FILE, "w") as f:
@@ -91,285 +137,414 @@ def load_focal():
     except Exception:
         return None
 
+# =========================
+# DISTANCE ESTIMATION
+# =========================
+
 def estimate_distance(tag):
     global FOCAL_LENGTH
-
     if FOCAL_LENGTH is None:
         return -1.0
-
     avg_pixels = tag_avg_pixels(tag)
     if avg_pixels <= 0:
         return 0.0
-
     distance = (TAG_SIZE * FOCAL_LENGTH) / avg_pixels
-
     dist_history.append(distance)
     if len(dist_history) > FILTER_SIZE:
         dist_history.pop(0)
-
     return float(np.median(dist_history))
+
+# =========================
+# DETECTION RESULT (shared between threads)
+# =========================
+
+class DetectionResult:
+    """เก็บผลลัพธ์ล่าสุดจาก detection thread"""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frame       = None
+        self.chosen      = None
+        self.aligned     = False
+        self.distance    = -1.0
+        self.cx          = 0
+        self.cy          = 0
+        self.tag_str     = ""
+        self.planting    = 0
+        self.spacing     = 0
+        self.interval    = 0
+        self.avg_px      = 0.0
+        self.offset      = 0
+        self.fps         = 0
+        self.ready       = False
+
+    def update(self, **kwargs):
+        with self.lock:
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+            self.ready = True
+
+    def get(self):
+        with self.lock:
+            return {
+                'frame':    self.frame,
+                'chosen':   self.chosen,
+                'aligned':  self.aligned,
+                'distance': self.distance,
+                'cx':       self.cx,
+                'cy':       self.cy,
+                'tag_str':  self.tag_str,
+                'planting': self.planting,
+                'spacing':  self.spacing,
+                'interval': self.interval,
+                'avg_px':   self.avg_px,
+                'offset':   self.offset,
+                'fps':      self.fps,
+                'ready':    self.ready,
+            }
+
+# =========================
+# DETECTION THREAD
+# ✅ แยก AprilTag detection ออกจาก main loop
+#    ทำให้ display/keyboard ไม่ถูก block
+# =========================
+
+class DetectionThread:
+
+    def __init__(self, stream, node, result_holder):
+        self.stream  = stream
+        self.node    = node
+        self.result  = result_holder
+        self.running = True
+
+        # focal length + tag lock — ใช้ร่วมกับ main thread ผ่าน lock
+        self._fl_lock       = threading.Lock()
+        self._focal_length  = load_focal()
+        self._target_tag    = None
+        self._lost_count    = 0
+        self._dist_history  = []
+
+        self._fps_time    = time.time()
+        self._fps_counter = 0
+        self._fps         = 0
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    # --- focal length property (thread-safe) ---
+    @property
+    def focal_length(self):
+        with self._fl_lock:
+            return self._focal_length
+
+    def set_focal_length(self, fl):
+        with self._fl_lock:
+            self._focal_length = fl
+            self._dist_history.clear()
+
+    # --- distance estimation (ไม่ใช้ global) ---
+    def _estimate_distance(self, tag):
+        fl = self.focal_length
+        if fl is None:
+            return -1.0
+        avg_pixels = tag_avg_pixels(tag)
+        if avg_pixels <= 0:
+            return 0.0
+        distance = (TAG_SIZE * fl) / avg_pixels
+        self._dist_history.append(distance)
+        if len(self._dist_history) > FILTER_SIZE:
+            self._dist_history.pop(0)
+        return float(np.median(self._dist_history))
+
+    def _run(self):
+        while self.running:
+            ret, frame = self.stream.read()
+            if not ret or frame is None:
+                time.sleep(0.005)
+                continue
+
+            h, w = frame.shape[:2]
+            cx_frame = w // 2
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            tags = at_detector.detect(gray)
+            chosen = None
+
+            # --- Tag Lock ---
+            if self._target_tag is None:
+                if tags:
+                    chosen = max(tags, key=tag_area)
+                    self._target_tag = chosen.tag_id
+                    self._lost_count = 0
+            else:
+                found = None
+                for t in tags:
+                    if t.tag_id == self._target_tag:
+                        found = t
+                        break
+                if found is not None:
+                    chosen = found
+                    self._lost_count = 0
+                else:
+                    self._lost_count += 1
+                if self._lost_count >= MAX_LOST:
+                    self._target_tag = None
+                    self._lost_count = 0
+
+            # --- Process ---
+            aligned  = False
+            cx = cy  = 0
+            tag_str  = ""
+            planting = spacing = interval = 0
+            avg_px   = 0.0
+            offset   = 0
+            distance = -1.0
+
+            if chosen is not None:
+                tag_str, planting, spacing, interval = decode_tagid_5digits(chosen.tag_id)
+                cx, cy = map(int, chosen.center)
+                distance = self._estimate_distance(chosen)
+                avg_px   = tag_avg_pixels(chosen)
+                offset   = cx - cx_frame
+                aligned  = abs(offset) <= CENTER_THRESH
+
+                if distance > 0:
+                    self.node.publish_tag(
+                        cx, cy, chosen.tag_id,
+                        planting, spacing, interval,
+                        distance, aligned
+                    )
+            else:
+                self.node.publish_lost()
+
+            # --- FPS ---
+            self._fps_counter += 1
+            now = time.time()
+            if now - self._fps_time >= 1.0:
+                self._fps = self._fps_counter
+                self._fps_counter = 0
+                self._fps_time = now
+
+            # --- ส่งผลลัพธ์ให้ main thread ---
+            self.result.update(
+                frame    = frame,
+                chosen   = chosen,
+                aligned  = aligned,
+                distance = distance,
+                cx       = cx,
+                cy       = cy,
+                tag_str  = tag_str,
+                planting = planting,
+                spacing  = spacing,
+                interval = interval,
+                avg_px   = avg_px,
+                offset   = offset,
+                fps      = self._fps,
+            )
+
+    def stop(self):
+        self.running = False
+
 
 # =========================
 # ROS2 NODE
 # =========================
+
 class AprilTagNode(Node):
+
     def __init__(self):
         super().__init__('apriltag_detector')
-
         self.pos_pub      = self.create_publisher(Point,   '/tag_position', 10)
-        self.id_pub       = self.create_publisher(Int32,   '/tag_id', 10)
+        self.id_pub       = self.create_publisher(Int32,   '/tag_id',       10)
         self.detect_pub   = self.create_publisher(Bool,    '/tag_detected', 10)
         self.planting_pub = self.create_publisher(Int32,   '/tag_planting', 10)
-        self.spacing_pub  = self.create_publisher(Int32,   '/tag_spacing', 10)
-        self.cabbage_pub  = self.create_publisher(Int32,   '/tag_cabbage', 10)
+        self.spacing_pub  = self.create_publisher(Int32,   '/tag_spacing',  10)
+        self.cabbage_pub  = self.create_publisher(Int32,   '/tag_cabbage',  10)
         self.dist_pub     = self.create_publisher(Float32, '/tag_distance', 10)
-        self.aligned_pub  = self.create_publisher(Bool,    '/tag_aligned', 10)
-        self.side_pub     = self.create_publisher(String,  '/tag_side', 10)
-
+        self.aligned_pub  = self.create_publisher(Bool,    '/tag_aligned',  10)
+        self.side_pub     = self.create_publisher(String,  '/tag_side',     10)
         self.get_logger().info("AprilTag Node Started")
 
-    def publish_tag(self, cx, cy, tag_id, planting, spacing, cabbage, distance, aligned, frame_w):
+    def publish_tag(self, cx, cy, tag_id, planting, spacing, cabbage, distance, aligned):
+
         pos = Point()
         pos.x = float(cx)
         pos.y = float(cy)
         pos.z = 0.0
         self.pos_pub.publish(pos)
 
-        id_msg = Int32()
-        id_msg.data = int(tag_id)
+        id_msg = Int32(); id_msg.data = tag_id
         self.id_pub.publish(id_msg)
 
-        det = Bool()
-        det.data = True
+        det = Bool(); det.data = True
         self.detect_pub.publish(det)
 
-        p = Int32()
-        p.data = int(planting)
+        p = Int32(); p.data = planting
         self.planting_pub.publish(p)
 
-        s = Int32()
-        s.data = int(spacing)
+        s = Int32(); s.data = spacing
         self.spacing_pub.publish(s)
 
-        c = Int32()
-        c.data = int(cabbage)
+        c = Int32(); c.data = cabbage
         self.cabbage_pub.publish(c)
 
-        d = Float32()
-        d.data = float(distance)
+        d = Float32(); d.data = float(distance)
         self.dist_pub.publish(d)
 
-        a = Bool()
-        a.data = bool(aligned)
+        a = Bool(); a.data = aligned
         self.aligned_pub.publish(a)
 
         side = String()
-        side.data = "LEFT" if cx < (frame_w // 2) else "RIGHT"
+        side.data = "LEFT" if cx < (640 // 2) else "RIGHT"
         self.side_pub.publish(side)
 
     def publish_lost(self):
-        det = Bool()
-        det.data = False
+        det = Bool(); det.data = False
         self.detect_pub.publish(det)
-
-        a = Bool()
-        a.data = False
+        a = Bool(); a.data = False
         self.aligned_pub.publish(a)
-
-        side = String()
-        side.data = "NONE"
+        side = String(); side.data = "NONE"
         self.side_pub.publish(side)
+
+# =========================
+# DRAW OVERLAY (เรียกจาก main thread เท่านั้น)
+# =========================
+
+def draw_overlay(frame, d: dict, fl):
+    """วาด overlay ทั้งหมดบน frame"""
+    h, w = frame.shape[:2]
+    cx_frame = w // 2
+
+    chosen  = d['chosen']
+    aligned = d['aligned']
+    cx      = d['cx']
+
+    # --- วาด tag corners & center ---
+    if chosen is not None:
+        corners = chosen.corners.astype(int)
+        for i in range(4):
+            cv2.line(frame,
+                     tuple(corners[i]),
+                     tuple(corners[(i+1) % 4]),
+                     (0, 255, 0), 2)
+        cv2.drawMarker(frame, (cx, d['cy']), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
+
+        dist_text = f"{d['distance']:.2f} m" if d['distance'] > 0 else "-- calibrate first --"
+        align_text  = "ALIGNED" if aligned else f"offset {d['offset']:+d}px"
+        align_color = (0, 255, 0) if aligned else (0, 0, 255)
+
+        cv2.putText(frame, f"TAG {d['tag_str']}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(frame, f"Distance: {dist_text}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(frame, f"Tag px: {d['avg_px']:.1f}  offset: {d['offset']:+d}px",
+                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+        cv2.putText(frame, align_text,
+                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, align_color, 2)
+
+        side_now   = "LEFT" if cx < cx_frame else "RIGHT"
+        side_color = (100, 200, 255) if side_now == "LEFT" else (255, 180, 100)
+        cv2.putText(frame, f"TAG SIDE: {side_now}",
+                    (cx_frame - 80, h - 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, side_color, 2)
+    else:
+        cv2.putText(frame, "Searching Tag...",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+    # --- เส้นกลางและ zone ---
+    line_color = (0, 255, 0) if aligned else (0, 255, 255)
+    cv2.line(frame, (cx_frame, 0), (cx_frame, h), line_color, 2)
+    cv2.line(frame, (cx_frame - CENTER_THRESH, 0), (cx_frame - CENTER_THRESH, h), (0, 180, 180), 1)
+    cv2.line(frame, (cx_frame + CENTER_THRESH, 0), (cx_frame + CENTER_THRESH, h), (0, 180, 180), 1)
+
+    cv2.putText(frame, "LEFT",  (10, h // 2),           cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 200, 255), 2)
+    cv2.putText(frame, "RIGHT", (cx_frame + 10, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 180, 100), 2)
+
+    # --- FPS + FL ---
+    cv2.putText(frame, f"FPS: {d['fps']}",
+                (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+    fl_text = f"FL={fl:.0f}" if fl else "FL=? (press C)"
+    cv2.putText(frame, fl_text,
+                (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
+
+    return frame
 
 # =========================
 # MAIN
 # =========================
+
 def main():
-    global target_tag, lost_count, FOCAL_LENGTH
 
     rclpy.init()
     node = AprilTagNode()
     threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
 
-    FOCAL_LENGTH = load_focal()
+    print("=" * 50)
+    print("  AprilTag Detector Node")
+    print(f"  Stream: {STREAM_URL}")
+    print("=" * 50)
 
-    print("[INFO] Opening GStreamer stream...")
-    cap = cv2.VideoCapture(GST_PIPELINE, cv2.CAP_GSTREAMER)
+    stream = FreshFrame(STREAM_URL)
 
-    if not cap.isOpened():
-        print("[ERROR] Cannot open GStreamer stream")
-        print(GST_PIPELINE)
-        node.destroy_node()
-        rclpy.shutdown()
-        return
+    # รอ frame แรก
+    print("[WAIT] รอ stream จาก Pi...")
+    for _ in range(100):
+        if stream.has_frame:
+            break
+        time.sleep(0.1)
+    if stream.has_frame:
+        print("[OK] ได้รับ stream แล้ว")
+    else:
+        print("[WARN] ยังไม่ได้ stream — ตรวจสอบ Pi IP")
 
-    if FOCAL_LENGTH is None:
+    result_holder   = DetectionResult()
+    detect_thread   = DetectionThread(stream, node, result_holder)
+
+    if detect_thread.focal_length is None:
         print("=" * 50)
         print("[CALIB] ยังไม่มี focal length")
         print(f"[CALIB] วาง tag ที่ระยะ {CALIB_DISTANCE_M}m แล้วกด 'c' เพื่อ calibrate")
         print("=" * 50)
     else:
-        print(f"[CALIB] ใช้ focal length = {FOCAL_LENGTH:.2f} (กด 'c' เพื่อ calibrate ใหม่)")
+        print(f"[CALIB] ใช้ focal length = {detect_thread.focal_length:.2f} (กด 'c' ถ้าต้องการ calibrate ใหม่)")
 
-    fps_time = time.time()
-    fps_counter = 0
-    fps = 0
-    frame_idx = 0
-    current_chosen = None
-    last_tags = []
-
+    # ✅ Main loop — แค่ display + handle keyboard
+    #    ไม่มี detection logic ที่นี่ → ไม่กระตุก
     while rclpy.ok():
-        ret, frame = cap.read()
-        if not ret or frame is None:
+
+        d = result_holder.get()
+
+        if not d['ready'] or d['frame'] is None:
+            if cv2.waitKey(10) & 0xFF == ord('q'):
+                break
             continue
 
-        h, w = frame.shape[:2]
-        cx_frame = w // 2
+        frame = d['frame'].copy()
+        frame = draw_overlay(frame, d, detect_thread.focal_length)
+        cv2.imshow("AprilTag Tracking", frame)
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-        frame_idx += 1
-
-        # ยังไม่ lock -> detect ทุกเฟรม
-        # lock แล้ว -> detect ทุก 2 เฟรม
-        if target_tag is None or (frame_idx % 2 == 0):
-            last_tags = at_detector.detect(gray)
-
-        tags = last_tags
-        chosen = None
-
-        # =========================
-        # TAG LOCK
-        # =========================
-        if target_tag is None:
-            if tags:
-                chosen = max(tags, key=tag_area)
-                target_tag = chosen.tag_id
-                lost_count = 0
-        else:
-            found = None
-            for t in tags:
-                if t.tag_id == target_tag:
-                    found = t
-                    break
-
-            if found is not None:
-                chosen = found
-                lost_count = 0
-            else:
-                lost_count += 1
-
-            if lost_count >= MAX_LOST:
-                target_tag = None
-                lost_count = 0
-
-        current_chosen = chosen
-        aligned = False
-
-        # =========================
-        # PROCESS TAG
-        # =========================
-        if chosen is not None:
-            tag_str, planting, spacing, interval = decode_tagid_5digits(chosen.tag_id)
-            corners = chosen.corners.astype(int)
-            cx, cy = map(int, chosen.center)
-            distance = estimate_distance(chosen)
-            avg_px = tag_avg_pixels(chosen)
-
-            offset = cx - cx_frame
-            aligned = abs(offset) <= CENTER_THRESH
-
-            node.publish_tag(
-                cx, cy,
-                chosen.tag_id,
-                planting, spacing, interval,
-                distance,
-                aligned,
-                w
-            )
-
-            for i in range(4):
-                cv2.line(
-                    frame,
-                    tuple(corners[i]),
-                    tuple(corners[(i + 1) % 4]),
-                    (0, 255, 0),
-                    2
-                )
-
-            cv2.drawMarker(frame, (cx, cy), (0, 0, 255), cv2.MARKER_CROSS, 20, 2)
-
-            cv2.putText(frame, f"TAG {tag_str}",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
-            dist_text = f"{distance:.2f} m" if distance > 0 else "-- calibrate first --"
-            cv2.putText(frame, f"Distance: {dist_text}",
-                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-            cv2.putText(frame, f"Tag px: {avg_px:.1f}  offset: {offset:+d}px",
-                        (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
-
-            align_text = "ALIGNED" if aligned else f"offset {offset:+d}px"
-            align_color = (0, 255, 0) if aligned else (0, 0, 255)
-            cv2.putText(frame, align_text,
-                        (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, align_color, 2)
-
-            side_now = "LEFT" if cx < cx_frame else "RIGHT"
-            side_color = (100, 200, 255) if side_now == "LEFT" else (255, 180, 100)
-            cv2.putText(frame, f"TAG SIDE: {side_now}",
-                        (cx_frame - 80, h - 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, side_color, 2)
-
-        else:
-            node.publish_lost()
-            cv2.putText(frame, "Searching Tag...",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-        # =========================
-        # OVERLAY
-        # =========================
-        line_color = (0, 255, 0) if aligned else (0, 255, 255)
-        cv2.line(frame, (cx_frame, 0), (cx_frame, h), line_color, 2)
-
-        cv2.line(frame, (cx_frame - CENTER_THRESH, 0), (cx_frame - CENTER_THRESH, h), (0, 180, 180), 1)
-        cv2.line(frame, (cx_frame + CENTER_THRESH, 0), (cx_frame + CENTER_THRESH, h), (0, 180, 180), 1)
-
-        cv2.putText(frame, "LEFT",
-                    (10, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (100, 200, 255), 2)
-        cv2.putText(frame, "RIGHT",
-                    (cx_frame + 10, h // 2), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 180, 100), 2)
-
-        fps_counter += 1
-        if time.time() - fps_time >= 1.0:
-            fps = fps_counter
-            fps_counter = 0
-            fps_time = time.time()
-
-        cv2.putText(frame, f"FPS: {fps}",
-                    (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
-
-        fl_text = f"FL={FOCAL_LENGTH:.0f}" if FOCAL_LENGTH else "FL=? (press C)"
-        cv2.putText(frame, fl_text,
-                    (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (180, 180, 180), 2)
-
-        cv2.imshow("AprilTag Tracking - UDP Low Latency", frame)
-        key = cv2.waitKey(1) & 0xFF
+        key = cv2.waitKey(1) & 0xFF  # ✅ waitKey(1) — ไม่ block นาน
 
         if key == ord('c'):
-            if current_chosen is not None:
-                avg_px = tag_avg_pixels(current_chosen)
-                FOCAL_LENGTH = (avg_px * CALIB_DISTANCE_M) / TAG_SIZE
-                dist_history.clear()
-                save_focal(FOCAL_LENGTH)
-                print(f"[CALIB] tag_px={avg_px:.1f} dist={CALIB_DISTANCE_M}m -> FL={FOCAL_LENGTH:.2f}")
+            # Calibrate focal length จาก chosen tag ปัจจุบัน
+            chosen = d['chosen']
+            if chosen is not None:
+                avg_px = tag_avg_pixels(chosen)
+                new_fl = (avg_px * CALIB_DISTANCE_M) / TAG_SIZE
+                detect_thread.set_focal_length(new_fl)
+                save_focal(new_fl)
+                print(f"[CALIB] tag_px={avg_px:.1f} dist={CALIB_DISTANCE_M}m → FL={new_fl:.2f}")
             else:
                 print("[CALIB] ไม่เห็น tag ตอนกด c — ลองใหม่")
 
         elif key == ord('q'):
             break
 
-    cap.release()
+    detect_thread.stop()
+    stream.release()
     cv2.destroyAllWindows()
     node.destroy_node()
     rclpy.shutdown()
+
 
 if __name__ == "__main__":
     main()
