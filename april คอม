@@ -1,0 +1,122 @@
+import subprocess
+import sys
+import signal
+
+# =========================
+# CONFIG
+# =========================
+PC_IP = "192.168.1.100"   # <<< เปลี่ยนเป็น IP ของคอม
+PORT = 5000
+
+DEVICE = "/dev/video0"    # webcam บน Pi
+WIDTH = 640
+HEIGHT = 480
+FPS = 30
+BITRATE_KBPS = 1500       # ปรับได้ เช่น 1000-2500
+
+# =========================
+# GStreamer pipeline
+# =========================
+# พยายามเปิดกล้องแบบ MJPEG ก่อน (เบา CPU กว่า)
+PIPELINE_MJPEG = [
+    "gst-launch-1.0", "-v",
+    "v4l2src", f"device={DEVICE}", "io-mode=2",
+    "!", f"image/jpeg,width={WIDTH},height={HEIGHT},framerate={FPS}/1",
+    "!", "jpegdec",
+    "!", "videoconvert",
+    "!", "queue",
+         "max-size-buffers=1",
+         "max-size-time=0",
+         "max-size-bytes=0",
+         "leaky=downstream",
+    "!", "x264enc",
+         "tune=zerolatency",
+         "speed-preset=ultrafast",
+         f"bitrate={BITRATE_KBPS}",
+         "key-int-max=15",
+         "bframes=0",
+    "!", "rtph264pay", "config-interval=1", "pt=96",
+    "!", "udpsink",
+         f"host={PC_IP}",
+         f"port={PORT}",
+         "sync=false",
+         "async=false"
+]
+
+# ถ้ากล้องไม่รองรับ MJPEG ให้ fallback เป็น raw
+PIPELINE_RAW = [
+    "gst-launch-1.0", "-v",
+    "v4l2src", f"device={DEVICE}", "io-mode=2",
+    "!", f"video/x-raw,width={WIDTH},height={HEIGHT},framerate={FPS}/1",
+    "!", "videoconvert",
+    "!", "queue",
+         "max-size-buffers=1",
+         "max-size-time=0",
+         "max-size-bytes=0",
+         "leaky=downstream",
+    "!", "x264enc",
+         "tune=zerolatency",
+         "speed-preset=ultrafast",
+         f"bitrate={BITRATE_KBPS}",
+         "key-int-max=15",
+         "bframes=0",
+    "!", "rtph264pay", "config-interval=1", "pt=96",
+    "!", "udpsink",
+         f"host={PC_IP}",
+         f"port={PORT}",
+         "sync=false",
+         "async=false"
+]
+
+proc = None
+
+def shutdown(*_):
+    global proc
+    print("\n[INFO] Shutting down sender...")
+    if proc and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            proc.kill()
+    sys.exit(0)
+
+def run_pipeline(pipeline):
+    print("[INFO] Starting pipeline:")
+    print(" ".join(pipeline))
+    return subprocess.Popen(pipeline)
+
+def main():
+    global proc
+
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    print("==========================================")
+    print(" Pi Camera Sender (Low Latency UDP/H264) ")
+    print("==========================================")
+    print(f"[INFO] PC IP   : {PC_IP}")
+    print(f"[INFO] PORT    : {PORT}")
+    print(f"[INFO] DEVICE  : {DEVICE}")
+    print(f"[INFO] SIZE    : {WIDTH}x{HEIGHT}")
+    print(f"[INFO] FPS     : {FPS}")
+    print(f"[INFO] BITRATE : {BITRATE_KBPS} kbps")
+    print("")
+
+    # ลอง MJPEG ก่อน
+    try:
+        proc = run_pipeline(PIPELINE_MJPEG)
+        ret = proc.wait()
+        print(f"[WARN] MJPEG pipeline exited with code {ret}, fallback to RAW")
+    except KeyboardInterrupt:
+        shutdown()
+
+    # ถ้า MJPEG ไม่ได้ ใช้ RAW
+    try:
+        proc = run_pipeline(PIPELINE_RAW)
+        proc.wait()
+    except KeyboardInterrupt:
+        shutdown()
+
+if __name__ == "__main__":
+    main()
