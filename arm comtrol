@@ -1,0 +1,419 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+#include <micro_ros_platformio.h>
+
+#include <rcl/rcl.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+
+#include <std_msgs/msg/string.h>
+#include <std_msgs/msg/float32.h>
+#include <rosidl_runtime_c/string_functions.h>
+
+// ============================
+// SERVO CONFIG
+// ============================
+
+#define SDA_PIN 21
+#define SCL_PIN 22
+
+#define SERVO_FREQ 50
+#define SERVO_NUM 6
+
+#define PULSE_MIN 100
+#define PULSE_MAX 600
+
+Adafruit_PWMServoDriver pwm(0x40);
+
+// ============================
+// PUMP CONFIG
+// ============================
+
+#define EN_PIN 25
+#define IN1_PIN 26
+#define IN2_PIN 27
+
+#define PWM_FREQ 1000
+#define PWM_RES 8
+#define PWM_CHANNEL 0
+
+// ============================
+// ULTRASONIC CONFIG
+// ============================
+
+#define TRIG_REAR 23
+#define ECHO_REAR 4
+
+#define TRIG_FRONT 19
+#define ECHO_FRONT 18
+
+#define SAFE_DISTANCE 20
+#define ULTRA_MAX_RANGE 400
+
+// ============================
+// POSITIONS
+// ============================
+
+uint16_t homePos[SERVO_NUM]  = {355,200,600,405,520,110};
+uint16_t readyPos[SERVO_NUM] = {355,260,530,405,520,110};
+
+uint16_t wristCenter = 405;
+uint16_t wristLeft   = 480;
+uint16_t wristRight  = 330;
+
+uint16_t currentPos[SERVO_NUM];
+
+// ============================
+// MOTION
+// ============================
+
+bool moving = false;
+int moveStep = 0;
+int moveSteps = 60;
+
+int moveDelayMs = 10;
+unsigned long lastMoveTime = 0;
+
+uint16_t moveStart[SERVO_NUM];
+uint16_t moveTarget[SERVO_NUM];
+
+int moveSingleIdx = -1;
+
+// ============================
+// micro ROS
+// ============================
+
+rcl_node_t node;
+rcl_subscription_t subscriber;
+rclc_executor_t executor;
+rcl_allocator_t allocator;
+rclc_support_t support;
+
+std_msgs__msg__String sub_msg;
+
+// ============================
+// ULTRASONIC ROS
+// ============================
+
+rcl_publisher_t pub_ultra_front;
+rcl_publisher_t pub_ultra_rear;
+
+std_msgs__msg__Float32 msg_front;
+std_msgs__msg__Float32 msg_rear;
+
+unsigned long lastUltraTime = 0;
+
+// ============================
+// ULTRASONIC FUNCTION
+// ============================
+
+float readUltrasonic(int trigPin,int echoPin){
+
+  digitalWrite(trigPin,LOW);
+  delayMicroseconds(5);
+
+  digitalWrite(trigPin,HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin,LOW);
+
+  long duration = pulseIn(echoPin,HIGH,30000);
+
+  if(duration <= 0) return -1;
+
+  float distance = duration * 0.0343 / 2.0;
+
+  if(distance > ULTRA_MAX_RANGE) return -1;
+
+  return distance;
+}
+// ============================
+// SERVO MOVE
+// ============================
+
+void startMove(int idx,uint16_t target){
+
+  moveSingleIdx=idx;
+  moveStart[idx]=currentPos[idx];
+  moveTarget[idx]=constrain(target,PULSE_MIN,PULSE_MAX);
+
+  moveStep=0;
+  moving=true;
+  lastMoveTime=millis();
+}
+
+void startMoveAll(uint16_t target[]){
+
+  moveSingleIdx=-1;
+
+  for(int i=0;i<SERVO_NUM;i++){
+    moveStart[i]=currentPos[i];
+    moveTarget[i]=constrain(target[i],PULSE_MIN,PULSE_MAX);
+  }
+
+  moveStep=0;
+  moving=true;
+  lastMoveTime=millis();
+}
+
+void updateMove(){
+
+  if(!moving) return;
+  if(millis()-lastMoveTime<moveDelayMs) return;
+
+  lastMoveTime=millis();
+  moveStep++;
+
+  if(moveSingleIdx>=0){
+
+    int i=moveSingleIdx;
+
+    uint16_t p = moveStart[i] +
+    (int32_t)(moveTarget[i]-moveStart[i]) * moveStep / moveSteps;
+
+    pwm.setPWM(i,0,p);
+
+    if(moveStep>=moveSteps){
+      currentPos[i]=moveTarget[i];
+      moving=false;
+    }
+
+  }else{
+
+    for(int i=0;i<SERVO_NUM;i++){
+
+      uint16_t p = moveStart[i] +
+      (int32_t)(moveTarget[i]-moveStart[i]) * moveStep / moveSteps;
+
+      pwm.setPWM(i,0,p);
+    }
+
+    if(moveStep>=moveSteps){
+
+      for(int i=0;i<SERVO_NUM;i++)
+      currentPos[i]=moveTarget[i];
+
+      moving=false;
+    }
+  }
+}
+
+// ============================
+// PUMP
+// ============================
+
+void pumpOn(int spd){
+
+  digitalWrite(IN1_PIN,HIGH);
+  digitalWrite(IN2_PIN,LOW);
+
+  ledcWrite(PWM_CHANNEL,constrain(spd,0,255));
+}
+
+void pumpOff(){
+
+  digitalWrite(IN1_PIN,LOW);
+  digitalWrite(IN2_PIN,LOW);
+
+  ledcWrite(PWM_CHANNEL,0);
+}
+
+// ============================
+// COMMAND HANDLER
+// ============================
+
+void handleCommand(String cmd){
+
+  cmd.trim();
+
+  if(cmd=="HOME"){startMoveAll(homePos);return;}
+  if(cmd=="READY"){startMoveAll(readyPos);return;}
+
+  if(cmd=="GRIP:OPEN"){startMove(4,520);return;}
+  if(cmd=="GRIP:CLOSE"){startMove(4,300);return;}
+
+  if(cmd=="WRIST:CENTER"){startMove(3,wristCenter);return;}
+  if(cmd=="WRIST:LEFT"){startMove(3,wristLeft);return;}
+  if(cmd=="WRIST:RIGHT"){startMove(3,wristRight);return;}
+
+  if(cmd=="PUMP:ON"){pumpOn(200);return;}
+  if(cmd=="PUMP:OFF"){pumpOff();return;}
+
+  if(cmd.startsWith("SPEED:")){
+    int sp = cmd.substring(6).toInt();
+    if(sp>0) moveSteps = sp;
+    return;
+  }
+
+  if(cmd.startsWith("SERVO:")){
+
+    String s = cmd.substring(6);
+    int colon = s.indexOf(':');
+
+    if(colon>0){
+
+      int idx = s.substring(0,colon).toInt();
+      int pulse = s.substring(colon+1).toInt();
+
+      if(idx>=0 && idx<SERVO_NUM){
+        startMove(idx,pulse);
+      }
+    }
+    return;
+  }
+
+  if(cmd.startsWith("ALL:")){
+
+    String s = cmd.substring(4);
+    uint16_t vals[SERVO_NUM];
+    int idx = 0;
+
+    while(s.length()>0 && idx<SERVO_NUM){
+
+      int comma = s.indexOf(',');
+
+      if(comma<0){
+        vals[idx++] = s.toInt();
+        break;
+      }
+
+      vals[idx++] = s.substring(0,comma).toInt();
+      s = s.substring(comma+1);
+    }
+
+    if(idx==SERVO_NUM){
+      startMoveAll(vals);
+    }
+    return;
+  }
+}
+
+// ============================
+// ROS CALLBACK
+// ============================
+
+void sub_callback(const void * msgin){
+
+  const std_msgs__msg__String * msg =
+  (const std_msgs__msg__String *)msgin;
+
+  char cmd_buffer[128];
+
+  size_t len = msg->data.size;
+  if(len>127) len=127;
+
+  memcpy(cmd_buffer,msg->data.data,len);
+
+  cmd_buffer[len]='\0';
+
+  handleCommand(String(cmd_buffer));
+}
+
+// ============================
+// SETUP
+// ============================
+
+void setup(){
+
+  Serial.begin(115200);
+  delay(2000);
+
+  set_microros_serial_transports(Serial);
+
+  Wire.begin(SDA_PIN,SCL_PIN);
+
+  pwm.begin();
+  pwm.setPWMFreq(SERVO_FREQ);
+
+  for(int i=0;i<SERVO_NUM;i++){
+    currentPos[i]=homePos[i];
+    pwm.setPWM(i,0,homePos[i]);
+  }
+
+  pinMode(IN1_PIN,OUTPUT);
+  pinMode(IN2_PIN,OUTPUT);
+
+  ledcSetup(PWM_CHANNEL,PWM_FREQ,PWM_RES);
+  ledcAttachPin(EN_PIN,PWM_CHANNEL);
+
+  pinMode(TRIG_REAR,OUTPUT);
+  pinMode(ECHO_REAR,INPUT);
+
+  pinMode(TRIG_FRONT,OUTPUT);
+  pinMode(ECHO_FRONT,INPUT);
+
+  allocator=rcl_get_default_allocator();
+
+  rclc_support_init(&support,0,NULL,&allocator);
+
+  rclc_node_init_default(&node,"esp32_arm","",&support);
+
+  rclc_subscription_init_default(
+      &subscriber,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs,msg,String),
+      "/arm_cmd"
+  );
+
+  rclc_publisher_init_default(
+      &pub_ultra_front,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs,msg,Float32),
+      "/ultra_front"
+  );
+
+  rclc_publisher_init_default(
+      &pub_ultra_rear,
+      &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs,msg,Float32),
+      "/ultra_rear"
+  );
+
+  rclc_executor_init(
+      &executor,
+      &support.context,
+      1,
+      &allocator
+  );
+
+  rosidl_runtime_c__String__init(&sub_msg.data);
+  sub_msg.data.data=(char*)malloc(128);
+  sub_msg.data.size=0;
+  sub_msg.data.capacity=128;
+
+  rclc_executor_add_subscription(
+      &executor,
+      &subscriber,
+      &sub_msg,
+      &sub_callback,
+      ON_NEW_DATA
+  );
+
+  Serial.println("ESP32 READY");
+}
+
+// ============================
+// LOOP
+// ============================
+
+void loop(){
+
+  updateMove();
+
+  if(millis()-lastUltraTime>100){
+
+    lastUltraTime=millis();
+
+    float d_front=readUltrasonic(TRIG_FRONT,ECHO_FRONT);
+    float d_rear=readUltrasonic(TRIG_REAR,ECHO_REAR);
+
+    msg_front.data=d_front;
+    msg_rear.data=d_rear;
+
+    rcl_publish(&pub_ultra_front,&msg_front,NULL);
+    rcl_publish(&pub_ultra_rear,&msg_rear,NULL);
+  }
+
+  rclc_executor_spin_some(&executor,RCL_MS_TO_NS(10));
+}
