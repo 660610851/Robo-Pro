@@ -3,13 +3,15 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-from matplotlib.widgets import Slider
+from matplotlib.widgets import Slider, Button
 import threading
 import queue
+import json
+import os
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy  # ← เพิ่ม
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String, Bool, Int32
 from geometry_msgs.msg import Point
 
@@ -32,6 +34,91 @@ HOLE_VERT = 350
 MAX_REACH = L1 + L2 - 0.01
 MIN_REACH = 0.05
 
+# ── Pose Slots ──────────────────────────────────────────────────
+POSE_FILE  = "arm_poses.json"
+pose_slots = [None] * 9   # 9 slots (1-9)
+
+def load_poses():
+    global pose_slots
+    if os.path.exists(POSE_FILE):
+        try:
+            with open(POSE_FILE) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                pose_slots = data
+            while len(pose_slots) < 9:
+                pose_slots.append(None)
+            print(f"[POSE] Loaded {POSE_FILE}")
+        except Exception as e:
+            print(f"[POSE] Load error: {e}")
+
+def save_poses():
+    with open(POSE_FILE, "w") as f:
+        json.dump(pose_slots, f, indent=2)
+    print(f"[POSE] Saved {POSE_FILE}")
+
+def save_slot(n):
+    """บันทึกตำแหน่งปัจจุบันลง slot n (0-8)"""
+    pose_slots[n] = {
+        "servos":        [current_base_pulse,
+                          angle_to_pulse(math.degrees(current_sh)),
+                          angle_to_pulse(math.degrees(current_el)),
+                          WRIST, GRIP, HOLE],
+        "grip_open":     grip_open,
+        "hole_vertical": hole_vertical,
+        "pump_on":       pump_on,
+        "speed":         arm_speed,
+    }
+    save_poses()
+    draw_all(f"SAVED slot {n+1}")
+    print(f"[POSE] Saved slot {n+1}  servos={pose_slots[n]['servos']}")
+
+def play_slot(n):
+    """เล่นท่าจาก slot n (0-8)"""
+    global grip_open, hole_vertical, pump_on, arm_speed
+    p = pose_slots[n]
+    if p is None:
+        print(f"[POSE] Slot {n+1} ว่าง — กด Shift+{n+1} เพื่อบันทึก")
+        draw_all(f"Slot {n+1} empty")
+        return
+    servos = p["servos"]
+    arm_speed     = p.get("speed", arm_speed)
+    grip_open     = p.get("grip_open", grip_open)
+    hole_vertical = p.get("hole_vertical", hole_vertical)
+    pump_on       = p.get("pump_on", pump_on)
+
+    speed_slider.set_val(arm_speed)
+
+    # ส่ง SPEED + ALL: ไป ESP32
+    _publish_cmd(f"SPEED:{arm_speed}")
+    cmd = "ALL:" + ",".join(str(int(v)) for v in servos)
+    _publish_cmd(cmd)
+    _publish_cmd("PUMP:ON" if pump_on else "PUMP:OFF")
+
+    # อัปเดต IK state
+    global current_sh, current_el, current_base_pulse
+    if len(servos) >= 6:
+        current_base_pulse = int(servos[0])
+        sh = math.radians(pulse_to_angle_deg(int(servos[1])))
+        el = math.radians(pulse_to_angle_deg(int(servos[2])))
+        current_sh, current_el = sh, el
+        rx, rz = fk(sh, el)
+        if _node: _node.publish_arm_state(rx, rz)
+
+    draw_all(f"PLAY slot {n+1}")
+    print(f"[POSE] Play slot {n+1}  {cmd}")
+
+def delete_slot(n):
+    """ลบ slot n"""
+    if pose_slots[n] is None:
+        print(f"[POSE] Slot {n+1} ว่างอยู่แล้ว")
+        return
+    pose_slots[n] = None
+    save_poses()
+    draw_all(f"DEL slot {n+1}")
+    print(f"[POSE] Deleted slot {n+1}")
+
+# ── Workspace ───────────────────────────────────────────────────
 _theta    = np.linspace(0, 2 * math.pi, 400)
 wsx_outer = (L1 + L2) * np.cos(_theta)
 wsz_outer = L0 + (L1 + L2) * np.sin(_theta)
@@ -70,11 +157,9 @@ def ik(x_real, z_real):
 _draw_queue = queue.Queue()
 
 def draw_all(note=""):
-    """Safe to call from ANY thread"""
     _draw_queue.put(note)
 
 def _flush_draw_queue():
-    """Call ONLY from main thread"""
     try:
         while True:
             note = _draw_queue.get_nowait()
@@ -86,22 +171,16 @@ def _flush_draw_queue():
 class IKControllerNode(Node):
     def __init__(self):
         super().__init__('ik_controller')
-
-        # ← QoS RELIABLE เพื่อให้ตรงกับ ESP32 (rclc_subscription_init_default)
         reliable_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
-
-        self.arm_cmd_pub   = self.create_publisher(String, '/arm_cmd',   reliable_qos)  # ← แก้
+        self.arm_cmd_pub   = self.create_publisher(String, '/arm_cmd',   reliable_qos)
         self.arm_state_pub = self.create_publisher(Point,  '/arm_state', 10)
         self.create_subscription(Point,  '/target_pose',  self.cb_target_pose,  10)
         self.create_subscription(String, '/arm_feedback', self.cb_arm_feedback, 10)
         self.create_subscription(Bool,   '/gripper_cmd',  self.cb_gripper,      10)
         self.create_subscription(Bool,   '/pump_cmd',     self.cb_pump,         10)
         self.get_logger().info('IK Controller Node started')
-        self.get_logger().info('Subscribing: /target_pose, /arm_feedback, /gripper_cmd, /pump_cmd')
-        self.get_logger().info('Publishing : /arm_cmd, /arm_state')
 
     def cb_target_pose(self, msg):
-        self.get_logger().info(f'[/target_pose] x={msg.x:.3f}  z={msg.z:.3f}')
         move_to(msg.x, msg.z)
 
     def cb_arm_feedback(self, msg):
@@ -132,19 +211,20 @@ def _publish_cmd(cmd_str):
         _node.publish_arm_cmd(cmd_str)
 
 # ── State ───────────────────────────────────────────────────────
-home_origin_x = 0.0
-home_origin_z = 0.0
-current_x     = 0.0
-current_z     = 0.0
-typed_text    = ""
-arm_speed     = 30
-grip_open     = True
-pump_on       = False
-hole_vertical = False
-base_rotated  = False
+home_origin_x      = 0.0
+home_origin_z      = 0.0
+current_x          = 0.0
+current_z          = 0.0
+typed_text         = ""
+arm_speed          = 30
+grip_open          = True
+pump_on            = False
+hole_vertical      = False
+base_rotated       = False
 current_sh         = math.radians(pulse_to_angle_deg(200))
 current_el         = math.radians(pulse_to_angle_deg(600))
 current_base_pulse = BASE_DEFAULT
+status_note        = ""   # แสดง feedback ใน plot
 
 def user_to_real(x, z): return x + home_origin_x, z + home_origin_z
 def real_to_user(x, z): return x - home_origin_x, z - home_origin_z
@@ -246,9 +326,55 @@ def show_pos():
     print(f"  Speed: {arm_speed}  Grip: {'OPEN' if grip_open else 'CLOSE'}  Pump: {'ON' if pump_on else 'OFF'}")
 
 # ── Figures ─────────────────────────────────────────────────────
-fig1 = plt.figure("Front View (X-Z)", figsize=(7, 8))
-ax        = fig1.add_axes([0.10, 0.18, 0.85, 0.78])
-ax_slider = fig1.add_axes([0.15, 0.06, 0.70, 0.04])
+fig1 = plt.figure("IK Controller + Pose Slots", figsize=(9, 9))
+ax        = fig1.add_axes([0.10, 0.30, 0.85, 0.66])
+ax_slider = fig1.add_axes([0.15, 0.22, 0.70, 0.03])
+
+# ── Slot buttons ────────────────────────────────────────────────
+# แถว 1: ปุ่ม PLAY  slot 1-9
+# แถว 2: ปุ่ม SAVE  slot 1-9
+# ปุ่ม DEL อยู่ขวาสุด
+
+_slot_play_btns = []
+_slot_save_btns = []
+_btn_del = None
+
+def _make_slot_buttons():
+    global _btn_del
+    w = 0.07; gap = 0.005; start_x = 0.08
+    for i in range(9):
+        x = start_x + i * (w + gap)
+        # PLAY row
+        ax_p = fig1.add_axes([x, 0.14, w, 0.035])
+        b = Button(ax_p, f"▶{i+1}", color='#2a6496', hovercolor='#3a74a6')
+        b.label.set_color('white'); b.label.set_fontsize(8)
+        idx = i
+        b.on_clicked(lambda e, n=idx: play_slot(n))
+        _slot_play_btns.append(b)
+        # SAVE row
+        ax_s = fig1.add_axes([x, 0.10, w, 0.035])
+        b2 = Button(ax_s, f"💾{i+1}", color='#3d6b35', hovercolor='#4d7b45')
+        b2.label.set_color('white'); b2.label.set_fontsize(8)
+        b2.on_clicked(lambda e, n=idx: save_slot(n))
+        _slot_save_btns.append(b2)
+    # DEL button — ลบ slot ที่พิมพ์ใน cmd
+    ax_d = fig1.add_axes([0.78, 0.05, 0.10, 0.035])
+    _btn_del = Button(ax_d, "🗑 DEL", color='#8b0000', hovercolor='#a00000')
+    _btn_del.label.set_color('white'); _btn_del.label.set_fontsize(8)
+    _btn_del.on_clicked(lambda e: _handle_del_btn())
+
+def _handle_del_btn():
+    global typed_text
+    cmd = typed_text.strip()
+    if cmd.isdigit() and 1 <= int(cmd) <= 9:
+        delete_slot(int(cmd)-1)
+        typed_text = ""
+    else:
+        print("[POSE] พิมพ์เลข 1-9 ใน input ก่อนแล้วกด DEL")
+        draw_all("พิมพ์ 1-9 แล้วกด DEL")
+
+_make_slot_buttons()
+
 fig2, ax2 = plt.subplots(figsize=(5, 5))
 fig2.canvas.manager.set_window_title("Side View (Y-Z)")
 fig3, ax3 = plt.subplots(figsize=(5, 5))
@@ -269,140 +395,224 @@ def set_speed(steps):
     speed_slider.set_val(arm_speed)
     draw_all()
 
+# ── Draw ────────────────────────────────────────────────────────
+
 def _draw_now(note=""):
     try:
         _draw_front(note); _draw_side(); _draw_top()
     except Exception as e:
         print(f"[draw error] {e}")
 
+def _slot_label(i):
+    """แสดง ✓ ถ้า slot มีข้อมูล"""
+    return f"▶{i+1}✓" if pose_slots[i] else f"▶{i+1}"
+
+def _update_slot_buttons():
+    """อัปเดตสีปุ่ม slot ให้สะท้อนสถานะ"""
+    for i, b in enumerate(_slot_play_btns):
+        b.label.set_text(_slot_label(i))
+        b.ax.set_facecolor('#1a5276' if pose_slots[i] else '#2a6496')
+
 def _draw_front(note=""):
     ax.clear()
     sh, el = current_sh, current_el
     x0, z0 = 0.0, L0
-    x1 = x0 + L1*math.cos(sh);  z1 = z0 + L1*math.sin(sh)
+    x1 = x0 + L1*math.cos(sh);    z1 = z0 + L1*math.sin(sh)
     x2 = x1 + L2*math.cos(sh+el); z2 = z1 + L2*math.sin(sh+el)
     xu, zu = real_to_user(x2, z2)
+
     ax.plot(wsx_outer, wsz_outer, 'g--', lw=1, alpha=0.4, label='Workspace')
     ax.plot(wsx_inner, wsz_inner, 'g--', lw=1, alpha=0.4)
-    ax.plot([0,0],[0,L0],'k-',lw=4,label='Base')
-    ax.plot([x0,x1],[z0,z1],'o-',lw=5,color='steelblue',label=f'Link1 {L1}m')
-    ax.plot([x1,x2],[z1,z2],'o-',lw=5,color='tomato',label=f'Link2 {L2}m')
-    ax.scatter(x2,z2,s=150,color='black',zorder=5)
-    ax.scatter(0,0,s=120,color='dimgray',marker='s',zorder=7,label='Base(0,0)')
-    if home_origin_x!=0.0 or home_origin_z!=0.0:
-        ax.scatter(home_origin_x,home_origin_z,s=250,marker='*',color='gold',zorder=6,label='Origin')
-    ax.text(x2+0.015,z2+0.015,
+    ax.plot([0,0],[0,L0], 'k-', lw=4, label='Base')
+    ax.plot([x0,x1],[z0,z1], 'o-', lw=5, color='steelblue', label=f'Link1 {L1}m')
+    ax.plot([x1,x2],[z1,z2], 'o-', lw=5, color='tomato',    label=f'Link2 {L2}m')
+    ax.scatter(x2, z2, s=150, color='black', zorder=5)
+    ax.scatter(0, 0, s=120, color='dimgray', marker='s', zorder=7, label='Base(0,0)')
+    if home_origin_x != 0.0 or home_origin_z != 0.0:
+        ax.scatter(home_origin_x, home_origin_z, s=250, marker='*',
+                   color='gold', zorder=6, label='Origin')
+
+    ax.text(x2+0.015, z2+0.015,
             f"EE real ({x2:.3f},{z2:.3f})\nuser ({xu:.3f},{zu:.3f})",
-            fontsize=8,bbox=dict(boxstyle='round,pad=0.3',facecolor='lightyellow',alpha=0.9))
+            fontsize=8, bbox=dict(boxstyle='round,pad=0.3',
+                                  facecolor='lightyellow', alpha=0.9))
+
     sl = 'Fast' if arm_speed<20 else 'Mid' if arm_speed<50 else 'Slow'
-    ax.text(-0.45,0.48,
+
+    # slot status line
+    slot_str = "  ".join(
+        f"[{i+1}]✓" if pose_slots[i] else f"[{i+1}] "
+        for i in range(9)
+    )
+
+    ax.text(-0.45, 0.48,
             f"Shoulder={math.degrees(sh):.1f}\n"
             f"Elbow   ={math.degrees(el):.1f}\n"
             f"Speed   ={arm_speed} ({sl})\n"
             f"Gripper ={'OPEN ' if grip_open else 'CLOSE'}  [G]\n"
-            f"Pump    ={'ON  ' if pump_on else 'OFF '}  [P]\n"
-            f"Hole    ={'Vertical' if hole_vertical else 'Flat    '}  [T]\n"
-            f"Base    ={'Rotated' if base_rotated else 'Normal '}  [B]\n"
-            f"ROS2    =Active",
-            fontsize=9,bbox=dict(facecolor='white',alpha=0.85),family='monospace')
-    ax.text(-0.45,0.20,f"Input: {typed_text}_",fontsize=9,
-            bbox=dict(facecolor='lightyellow',alpha=0.8))
-    ax.set_xlim(-0.50,0.55); ax.set_ylim(-0.15,0.55)
+            f"Pump    ={'ON  '  if pump_on   else 'OFF '}  [P]\n"
+            f"Hole    ={'Vert' if hole_vertical else 'Flat'}  [T]\n"
+            f"Base    ={'Rot' if base_rotated  else 'Norm'}  [B]\n"
+            f"Slots   ={slot_str}",
+            fontsize=8, bbox=dict(facecolor='white', alpha=0.85),
+            family='monospace')
+
+    ax.text(-0.45, 0.18, f"Input: {typed_text}_", fontsize=9,
+            bbox=dict(facecolor='lightyellow', alpha=0.8))
+
+    if note:
+        ax.text(0.0, -0.10, note, fontsize=10, color='darkgreen',
+                ha='center', bbox=dict(facecolor='#e8f5e9', alpha=0.9))
+
+    ax.set_xlim(-0.50, 0.55); ax.set_ylim(-0.15, 0.55)
     ax.set_xlabel("X (m)"); ax.set_ylabel("Z (m)")
-    ax.set_title(f"Front View  {note}\nx,z->ENTER | G P T B | home/ready/ready0/q")
-    ax.legend(loc='upper right',fontsize=7); ax.grid(True,alpha=0.4)
+    ax.set_title("IK Controller\n"
+                 "▶1-9=play  💾1-9=save  🗑=del  |  G P T B  |  home/ready/ready0")
+    ax.legend(loc='upper right', fontsize=7)
+    ax.grid(True, alpha=0.4)
+    _update_slot_buttons()
     fig1.canvas.draw(); fig1.canvas.flush_events()
 
 def _draw_side():
     ax2.clear()
-    sh,el = current_sh,current_el
+    sh, el = current_sh, current_el
     bd = math.radians(pulse_to_angle_deg(current_base_pulse))
-    r1=L1*math.cos(sh); r2=r1+L2*math.cos(sh+el)
-    z0=L0; z1=z0+L1*math.sin(sh); z2=z1+L2*math.sin(sh+el)
-    y1=r1*math.sin(bd); y2=r2*math.sin(bd)
-    ax2.plot([0,0],[0,L0],'k-',lw=4,label='Base')
-    ax2.plot([0,y1],[z0,z1],'o-',lw=5,color='steelblue',label='Link1')
-    ax2.plot([y1,y2],[z1,z2],'o-',lw=5,color='tomato',label='Link2')
-    ax2.scatter(y2,z2,s=150,color='black',zorder=5)
+    r1 = L1*math.cos(sh); r2 = r1+L2*math.cos(sh+el)
+    z0 = L0; z1 = z0+L1*math.sin(sh); z2 = z1+L2*math.sin(sh+el)
+    y1 = r1*math.sin(bd); y2 = r2*math.sin(bd)
+    ax2.plot([0,0],[0,L0], 'k-', lw=4, label='Base')
+    ax2.plot([0,y1],[z0,z1], 'o-', lw=5, color='steelblue', label='Link1')
+    ax2.plot([y1,y2],[z1,z2], 'o-', lw=5, color='tomato', label='Link2')
+    ax2.scatter(y2, z2, s=150, color='black', zorder=5)
     ax2.set_xlim(-0.50,0.50); ax2.set_ylim(-0.15,0.55)
     ax2.set_xlabel("Y (m)"); ax2.set_ylabel("Z (m)")
     ax2.set_title(f"Side View  Base={pulse_to_angle_deg(current_base_pulse):.1f}")
-    ax2.legend(loc='upper right',fontsize=7); ax2.grid(True,alpha=0.4)
+    ax2.legend(loc='upper right', fontsize=7); ax2.grid(True, alpha=0.4)
     fig2.canvas.draw(); fig2.canvas.flush_events()
 
 def _draw_top():
     ax3.clear()
-    sh,el = current_sh,current_el
+    sh, el = current_sh, current_el
     bd = math.radians(pulse_to_angle_deg(current_base_pulse))
-    r1=L1*math.cos(sh); r2=r1+L2*math.cos(sh+el)
-    x1=r1*math.cos(bd); y1=r1*math.sin(bd)
-    x2=r2*math.cos(bd); y2=r2*math.sin(bd)
-    _t=np.linspace(0,2*math.pi,400)
-    ax3.plot((L1+L2)*np.cos(_t),(L1+L2)*np.sin(_t),'g--',alpha=0.4)
-    ax3.plot(abs(L1-L2)*np.cos(_t),abs(L1-L2)*np.sin(_t),'g--',alpha=0.4)
-    ax3.plot([0,x1],[0,y1],'o-',lw=5,color='steelblue',label='Link1')
-    ax3.plot([x1,x2],[y1,y2],'o-',lw=5,color='tomato',label='Link2')
-    ax3.scatter(x2,y2,s=150,color='black',zorder=5)
-    ax3.scatter(0,0,s=120,color='dimgray',marker='s',zorder=7)
-    bx=0.08*math.cos(bd); by=0.08*math.sin(bd)
-    ax3.annotate('',xy=(bx,by),xytext=(0,0),
-                 arrowprops=dict(arrowstyle='->',color='purple',lw=2))
-    ax3.text(x2+0.01,y2+0.01,f"EE({x2:.2f},{y2:.2f})",fontsize=7)
+    r1 = L1*math.cos(sh); r2 = r1+L2*math.cos(sh+el)
+    x1 = r1*math.cos(bd); y1 = r1*math.sin(bd)
+    x2 = r2*math.cos(bd); y2 = r2*math.sin(bd)
+    _t = np.linspace(0,2*math.pi,400)
+    ax3.plot((L1+L2)*np.cos(_t), (L1+L2)*np.sin(_t), 'g--', alpha=0.4)
+    ax3.plot(abs(L1-L2)*np.cos(_t), abs(L1-L2)*np.sin(_t), 'g--', alpha=0.4)
+    ax3.plot([0,x1],[0,y1], 'o-', lw=5, color='steelblue', label='Link1')
+    ax3.plot([x1,x2],[y1,y2], 'o-', lw=5, color='tomato', label='Link2')
+    ax3.scatter(x2, y2, s=150, color='black', zorder=5)
+    ax3.scatter(0, 0, s=120, color='dimgray', marker='s', zorder=7)
+    bx = 0.08*math.cos(bd); by = 0.08*math.sin(bd)
+    ax3.annotate('', xy=(bx,by), xytext=(0,0),
+                 arrowprops=dict(arrowstyle='->', color='purple', lw=2))
+    ax3.text(x2+0.01, y2+0.01, f"EE({x2:.2f},{y2:.2f})", fontsize=7)
     ax3.set_xlim(-0.50,0.50); ax3.set_ylim(-0.50,0.50)
     ax3.set_xlabel("X (m)"); ax3.set_ylabel("Y (m)")
     ax3.set_title(f"Top View  Base={pulse_to_angle_deg(current_base_pulse):.1f}")
-    ax3.legend(loc='upper right',fontsize=7); ax3.grid(True,alpha=0.4); ax3.set_aspect('equal')
+    ax3.legend(loc='upper right', fontsize=7)
+    ax3.grid(True, alpha=0.4); ax3.set_aspect('equal')
     fig3.canvas.draw(); fig3.canvas.flush_events()
+
+# ── Keyboard ────────────────────────────────────────────────────
+
+# Shift+1~9 = save slot
+SAVE_KEYS = {'!':0,'@':1,'#':2,'$':3,'%':4,'^':5,'&':6,'*':7,'(':8}
 
 def on_key(event):
     global typed_text
-    if event.key == 'g' and typed_text == "": gripper_toggle(); return
-    if event.key == 'p' and typed_text == "": pump_toggle(); return
-    if event.key == 't' and typed_text == "": hole_toggle(); return
-    if event.key == 'b' and typed_text == "": base_toggle(); return
-    if event.key == 'escape':
+    k = event.key
+
+    # single-key shortcuts (เฉพาะตอน input ว่าง)
+    if typed_text == "":
+        if k == 'g': gripper_toggle(); return
+        if k == 'p': pump_toggle();    return
+        if k == 't': hole_toggle();    return
+        if k == 'b': base_toggle();    return
+
+        # 1-9 = play slot
+        if k in '123456789':
+            play_slot(int(k)-1); return
+
+        # Shift+1~9 = save slot
+        if k in SAVE_KEYS:
+            save_slot(SAVE_KEYS[k]); return
+
+        # ) = Shift+0 = delete slot ที่พิมพ์
+        if k == ')':
+            _handle_del_btn(); return
+
+    if k == 'escape':
         typed_text = ""; draw_all()
-    elif event.key == 'backspace':
+    elif k == 'backspace':
         typed_text = typed_text[:-1]; draw_all()
-    elif event.key == 'enter':
+    elif k == 'enter':
         cmd = typed_text.strip(); typed_text = ""
         print(f"\n[graph] >> {cmd}"); _handle_cmd(cmd)
-    elif event.key and len(event.key) == 1:
-        typed_text += event.key; draw_all()
+    elif k and len(k) == 1:
+        typed_text += k; draw_all()
 
 fig1.canvas.mpl_connect('key_press_event', on_key)
 fig2.canvas.mpl_connect('key_press_event', on_key)
 fig3.canvas.mpl_connect('key_press_event', on_key)
 
 def _handle_cmd(cmd):
-    if cmd == "q":
+    c = cmd.lower().strip()
+    if c == "q":
         rclpy.shutdown(); plt.close('all'); print("Shutdown."); return
-    elif cmd == "home":           home()
-    elif cmd == "ready":          ready()
-    elif cmd == "ready0":         ready(set_origin=True)
-    elif cmd == "pos":            show_pos()
-    elif cmd in ("g","grip"):     gripper_toggle()
-    elif cmd == "grip open":      gripper_open()
-    elif cmd == "grip close":     gripper_close()
-    elif cmd in ("p","pump"):     pump_toggle()
-    elif cmd in ("t","hole"):     hole_toggle()
-    elif cmd in ("b","base"):     base_toggle()
-    elif cmd.lower().startswith("servo"):
+    elif c == "home":           home()
+    elif c == "ready":          ready()
+    elif c == "ready0":         ready(set_origin=True)
+    elif c == "pos":            show_pos()
+    elif c in ("g","grip"):     gripper_toggle()
+    elif c == "grip open":      gripper_open()
+    elif c == "grip close":     gripper_close()
+    elif c in ("p","pump"):     pump_toggle()
+    elif c in ("t","hole"):     hole_toggle()
+    elif c in ("b","base"):     base_toggle()
+
+    # save <n>  หรือ  save:<n>
+    elif c.startswith("save"):
         try:
-            c = cmd.split(":",1)[1] if ":" in cmd else cmd.split(" ",1)[1]
-            parts = c.replace(","," ").split()
-            idx,val = int(parts[0]),int(parts[1])
+            n = int(c.replace("save","").replace(":","").strip())
+            save_slot(n-1)
+        except: print("format: save <1-9>")
+
+    # play <n>
+    elif c.startswith("play"):
+        try:
+            n = int(c.replace("play","").replace(":","").strip())
+            play_slot(n-1)
+        except: print("format: play <1-9>")
+
+    # del <n>
+    elif c.startswith("del"):
+        try:
+            n = int(c.replace("del","").replace(":","").strip())
+            delete_slot(n-1)
+        except: print("format: del <1-9>")
+
+    elif c.lower().startswith("servo"):
+        try:
+            part = c.split(":",1)[1] if ":" in c else c.split(" ",1)[1]
+            parts = part.replace(","," ").split()
+            idx, val = int(parts[0]), int(parts[1])
             _publish_cmd(f"SERVO:{idx}:{val}")
             print(f"  SERVO:{idx} -> {val}")
         except: print("format: servo <idx> <pulse>")
-    elif cmd.startswith("speed ") or cmd.startswith("spd "):
-        try: set_speed(int(cmd.split()[1]))
+
+    elif c.startswith("speed ") or c.startswith("spd "):
+        try: set_speed(int(c.split()[1]))
         except: print("format: speed <5-80>")
+
     else:
         try:
             parts = cmd.replace(","," ").split()
             move_to(float(parts[0]), float(parts[1]))
         except: print(f"Invalid: '{cmd}'")
+
+# ── Main ────────────────────────────────────────────────────────
 
 def main():
     global _node
@@ -410,19 +620,21 @@ def main():
     _node = IKControllerNode()
     threading.Thread(target=rclpy.spin, args=(_node,), daemon=True).start()
 
-    print("="*50)
-    print("IK Controller  L0={} L1={} L2={}".format(L0,L1,L2))
-    print("PUB /arm_cmd -> ESP32  |  SUB /target_pose <- path_planning")
-    print("Keys: G=Gripper P=Pump T=Hole B=Base")
-    print("Cmds: home/ready/ready0/pos/speed N/x z/q")
-    print("="*50)
+    load_poses()
+
+    print("=" * 55)
+    print(f"IK Controller  L0={L0} L1={L1} L2={L2}")
+    print("Slots : 1-9=play  Shift+1~9=save  )=del  del <n>=ลบ")
+    print("Keys  : G=Grip  P=Pump  T=Hole  B=Base")
+    print("Cmds  : home/ready/ready0/pos/speed N/x z/q")
+    print("=" * 55)
 
     home()
     plt.show(block=False)
     _flush_draw_queue()
 
     import select, sys
-    while any(plt.fignum_exists(f.number) for f in [fig1,fig2,fig3]):
+    while any(plt.fignum_exists(f.number) for f in [fig1, fig2, fig3]):
         _flush_draw_queue()
         plt.pause(0.05)
         if select.select([sys.stdin],[],[],0)[0]:
