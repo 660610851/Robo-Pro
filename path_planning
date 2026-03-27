@@ -1,0 +1,124 @@
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Point
+from std_msgs.msg import Int32, Bool, String
+from std_msgs.msg import Float32
+
+# =========================
+# CONFIG
+# =========================
+FRAME_WIDTH = 640
+
+
+class PathPlanningNode(Node):
+    def __init__(self):
+        super().__init__('path_planning')
+
+        # SUB <- PC (AprilTag detector)
+        self.create_subscription(Point, '/tag_position', self.cb_position,  10)
+        self.create_subscription(Int32, '/tag_id',       self.cb_tag_id,    10)
+        self.create_subscription(Bool,  '/tag_detected', self.cb_detected,  10)
+        self.create_subscription(Int32, '/tag_planting', self.cb_planting,  10)
+        self.create_subscription(Int32, '/tag_spacing',  self.cb_spacing,   10)
+        self.create_subscription(Int32, '/tag_cabbage',  self.cb_cabbage,   10)
+        self.create_subscription(Float32, '/cabbage_size',   self.cb_cab_size,   10)
+        self.create_subscription(String,  '/cabbage_status', self.cb_cab_status, 10)
+        self.create_subscription(Point,   '/pot_position',   self.cb_pot_pos,    10)
+
+
+        self.cab_size   = -1.0
+        self.cab_status = "NONE"
+        self.pot_cx     = 0
+        self.pot_cy     = 0
+        # state
+        self.tag_detected = False
+        self.tag_cx       = 0
+        self.tag_cy       = 0
+        self.tag_id       = -1
+        self.planting     = 0
+        self.spacing      = 0
+        self.cabbage      = 0
+
+        # timer แสดงข้อมูลทุก 500ms
+        self.create_timer(0.5, self.log_status)
+
+        self.get_logger().info('Path Planning Node started (receive only)')
+        self.get_logger().info('SUB /tag_position  <- PC')
+        self.get_logger().info('SUB /tag_id        <- PC')
+        self.get_logger().info('SUB /tag_detected  <- PC')
+        self.get_logger().info('SUB /tag_planting  <- PC')
+        self.get_logger().info('SUB /tag_spacing   <- PC')
+        self.get_logger().info('SUB /tag_cabbage   <- PC')
+
+    # ── Callbacks ────────────────────────────────────────────────
+    def cb_cab_size(self, msg):   self.cab_size   = msg.data
+    def cb_cab_status(self, msg): self.cab_status = msg.data
+    def cb_pot_pos(self, msg):
+        self.pot_cx = int(msg.x)
+        self.pot_cy = int(msg.y)
+    def cb_position(self, msg: Point):
+        self.tag_cx = int(msg.x)
+        self.tag_cy = int(msg.y)
+
+    def cb_tag_id(self, msg: Int32):
+        self.tag_id = msg.data
+
+    def cb_detected(self, msg: Bool):
+        self.tag_detected = msg.data
+
+    def cb_planting(self, msg: Int32):
+        self.planting = msg.data
+
+    def cb_spacing(self, msg: Int32):
+        self.spacing = msg.data
+
+    def cb_cabbage(self, msg: Int32):
+        self.cabbage = msg.data
+
+    # ── Log Status ───────────────────────────────────────────────
+    def log_status(self):
+        if not self.tag_detected:
+            self.get_logger().info('No tag detected')
+            return
+        
+        self.get_logger().info(
+            f'Cabbage: {self.cab_size:.1f}cm [{self.cab_status}] | '
+            f'Pot: ({self.pot_cx},{self.pot_cy})'
+        )
+
+        offset = self.tag_cx - (FRAME_WIDTH // 2)
+        self.get_logger().info(
+            f'TAG:{self.tag_id:05d} | '
+            f'cx={self.tag_cx} cy={self.tag_cy} offset={offset}px | '
+            f'plant={self.planting}cm '
+            f'spacing={self.spacing}cm '
+            f'cabbage={self.cabbage}cm'
+        )
+
+
+def main():
+    rclpy.init()
+    node = PathPlanningNode()
+
+    print("=" * 50)
+    print("Path Planning Node (receive only)")
+    print()
+    print("SUB  /tag_position  <- PC")
+    print("SUB  /tag_id        <- PC")
+    print("SUB  /tag_detected  <- PC")
+    print("SUB  /tag_planting  <- PC")
+    print("SUB  /tag_spacing   <- PC")
+    print("SUB  /tag_cabbage   <- PC")
+    print("=" * 50)
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
