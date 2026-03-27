@@ -1,0 +1,137 @@
+import cv2
+from flask import Flask, Response
+import threading
+import time
+import queue
+
+app = Flask(__name__)
+
+# --- CONFIG ---
+CAMERA_INDEX = 0
+WIDTH, HEIGHT = 640, 480# ✅ ขนาดเล็กพอ ไม่ต้องลดอีก
+FPS = 15                   # ✅ ลด 30→15: Hotspot ไม่ทนเกิน 20 แบบ real-time
+
+class CameraServer:
+    def __init__(self, index):
+        self.index = index
+        self.running = True
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.has_frame = False
+        self.thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.thread.start()
+
+    def _capture_loop(self):
+        while self.running:
+            # ✅ เพิ่ม: V4L2 backend ตรงๆ เร็วกว่า auto-detect บน Linux/Pi
+            cap = cv2.VideoCapture(self.index, cv2.CAP_V4L2)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            # ✅ เพิ่ม: ใช้ MJPEG จากกล้องโดยตรง — Pi ไม่ต้อง decode/encode เอง ลด CPU 50%+
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+
+            if not cap.isOpened():
+                print(f"[RETRY] ไม่เจอกล้อง {self.index}... รอ 3 วิ")
+                time.sleep(3)
+                continue
+
+            print(f"[CONNECTED] กล้อง {self.index} พร้อม")
+
+            while self.running:
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print("[LOST] กล้องหลุด")
+                    break
+
+                with self.lock:
+                    self.latest_frame = frame  # ✅ เขียนทับเสมอ ไม่มีคิวค้าง
+                    self.has_frame = True
+
+            cap.release()
+            time.sleep(1)
+
+    def get_latest_frame(self):
+        with self.lock:
+            if not self.has_frame:
+                return False, None
+            return True, self.latest_frame  # ✅ ไม่ .copy() — เร็วกว่า, encode_worker อ่านเสร็จก็ทิ้ง
+
+
+cam_server = CameraServer(CAMERA_INDEX)
+
+# ✅ encode_queue เก็บแค่ 1 เฟรม — ถ้า network ส่งไม่ทัน ให้ทิ้งเฟรมเก่าทันที
+encode_queue = queue.Queue(maxsize=1)
+
+def encode_worker():
+    interval = 1.0 / FPS
+    while True:
+        t0 = time.time()
+
+        success, frame = cam_server.get_latest_frame()
+        if not success:
+            time.sleep(0.01)
+            continue
+
+        # ✅ ลด quality ลง: 30 พอสำหรับ YOLO detection, ลด bandwidth ~40%
+        ret, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if not ret:
+            continue
+
+        # โยนเฟรมเก่าทิ้งทันที ไม่รอ
+        if encode_queue.full():
+            try:
+                encode_queue.get_nowait()
+            except queue.Empty:
+                pass
+        encode_queue.put(buf.tobytes())
+
+        # ✅ ชดเชยเวลา encode จริง กัน drift
+        elapsed = time.time() - t0
+        sleep_time = interval - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+
+threading.Thread(target=encode_worker, daemon=True).start()
+
+
+def generate():
+    while True:
+        try:
+            # ✅ timeout สั้น: ถ้าไม่มีเฟรมใน 0.2วิ ให้ลอง loop ใหม่เลย
+            data = encode_queue.get(timeout=0.2)
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + data + b'\r\n')
+        except queue.Empty:
+            continue
+
+
+@app.route('/stream')
+def stream_route():
+    return Response(
+        generate(),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+        headers={
+            # ✅ เพิ่ม: บอก browser/client ห้าม cache เด็ดขาด ได้เฟรมสดเสมอ
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+        }
+    )
+
+
+def main():
+    import logging
+    log = logging.getLogger('werkzeug')
+    log.setLevel(logging.ERROR)
+    print("--- Server Started at Port 5001 ---")
+    try:
+        app.run(host='0.0.0.0', port=5001, threaded=True, debug=False, use_reloader=False)
+    except Exception as e:
+        print(f"Flask Fatal Error: {e}")
+
+
+if __name__ == '__main__':
+    main()
