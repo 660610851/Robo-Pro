@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+
+import sys, time, threading
+from collections import deque
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import MultiThreadedExecutor
+
+from std_msgs.msg import String, Float32, Int32MultiArray
+
+import matplotlib
+# ✅ ลองใช้ display ถ้ามี ถ้าไม่มีใช้ Agg (headless)
+import os
+if not os.environ.get('DISPLAY'):
+    matplotlib.use('Agg')
+    HEADLESS = True
+else:
+    try:
+        matplotlib.use('TkAgg')
+        HEADLESS = False
+    except Exception:
+        matplotlib.use('Agg')
+        HEADLESS = True
+
+import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Slider, Button
+
+# =========================
+# ROBOT PARAM
+# =========================
+
+WHEEL_DIAMETER = 12.5
+PPR            = 11440
+CM_PER_PULSE   = (3.1416 * WHEEL_DIAMETER) / PPR
+
+# =========================
+# BUFFER
+# =========================
+
+MAX_POINTS = 300
+
+time_data = deque(maxlen=MAX_POINTS)
+spd_data  = deque(maxlen=MAX_POINTS)
+acc_data  = deque(maxlen=MAX_POINTS)
+pid_data  = deque(maxlen=MAX_POINTS)
+enc_data  = deque(maxlen=MAX_POINTS)
+uf_data   = deque(maxlen=MAX_POINTS)
+ur_data   = deque(maxlen=MAX_POINTS)
+err_data  = deque(maxlen=MAX_POINTS)
+upid_r    = deque(maxlen=MAX_POINTS)
+upid_f    = deque(maxlen=MAX_POINTS)
+
+start_time = time.time()
+
+# =========================
+# ULTRASONIC PID STATE
+# =========================
+
+ultra_pid = {
+    "Kp": 0.8, "Ki": 0.05, "Kd": 0.2,
+    "Kp_f": 0.5, "Ki_f": 0.0, "Kd_f": 0.1,
+    "integral_r": 0.0, "last_err_r": 0.0, "last_t_r": time.time(),
+    "integral_f": 0.0, "last_err_f": 0.0, "last_t_f": time.time(),
+    "setpoint_dist": 10.0,
+    "setpoint_diff": 0.0,
+    "deadband_r": 1.5,
+    "deadband_f": 2.0,
+}
+
+def compute_pid_rotate(f, r):
+    pid = ultra_pid
+    now = time.time()
+    dt  = max(0.01, now - pid["last_t_r"])
+    err = (f - r) - pid["setpoint_diff"]
+    if abs(err) < pid["deadband_r"]:
+        pid["integral_r"] = 0.0; pid["last_err_r"] = err; pid["last_t_r"] = now
+        return 0.0
+    pid["integral_r"] += err * dt
+    pid["integral_r"]  = max(-30, min(30, pid["integral_r"]))
+    deriv = (err - pid["last_err_r"]) / dt
+    out   = pid["Kp"]*err + pid["Ki"]*pid["integral_r"] + pid["Kd"]*deriv
+    pid["last_err_r"] = err; pid["last_t_r"] = now
+    return out
+
+def compute_pid_forward(f, r):
+    pid = ultra_pid
+    now = time.time()
+    dt  = max(0.01, now - pid["last_t_f"])
+    avg = (f + r) / 2.0
+    err = avg - pid["setpoint_dist"]
+    if abs(err) < pid["deadband_f"]:
+        pid["integral_f"] = 0.0; pid["last_err_f"] = err; pid["last_t_f"] = now
+        return 0.0
+    pid["integral_f"] += err * dt
+    pid["integral_f"]  = max(-30, min(30, pid["integral_f"]))
+    deriv = (err - pid["last_err_f"]) / dt
+    out   = pid["Kp_f"]*err + pid["Ki_f"]*pid["integral_f"] + pid["Kd_f"]*deriv
+    pid["last_err_f"] = err; pid["last_t_f"] = now
+    return out
+
+# =========================
+# ROS NODE
+# =========================
+
+class MotorNode(Node):
+    def __init__(self):
+        super().__init__("motor_monitor")
+        self.last_cmd    = "STOP"
+        self.encoder     = {"LB":0,"LF":0,"RB":0,"RF":0}
+        self.robot_speed = 0.0
+        self.robot_accel = 0.0
+        self.pid_error   = 0.0
+        self.ultra_front = 0.0
+        self.ultra_rear  = 0.0
+        self.create_subscription(String,         "/drive_cmd",     self.cb_drive_cmd,   10)
+        self.create_subscription(Int32MultiArray, "/wheel_encoder", self.cb_encoder,     10)
+        self.create_subscription(Float32,         "/wheel_speed",   self.cb_speed,       10)
+        self.create_subscription(Float32,         "/wheel_accel",   self.cb_accel,       10)
+        self.create_subscription(Float32,         "/pid_error",     self.cb_pid,         10)
+        self.create_subscription(Float32,         "/ultra_front",   self.cb_ultra_front, 10)
+        self.create_subscription(Float32,         "/ultra_rear",    self.cb_ultra_rear,  10)
+        self.get_logger().info("Motor monitor started")
+
+    def cb_drive_cmd(self, msg): self.last_cmd = msg.data
+    def cb_encoder(self, msg):
+        if len(msg.data) >= 4:
+            self.encoder = {k: msg.data[i]*CM_PER_PULSE
+                            for i,k in enumerate(["LB","LF","RB","RF"])}
+            enc_data.append(sum(self.encoder.values())/4.0)
+    def cb_speed(self, msg):  self.robot_speed = msg.data
+    def cb_accel(self, msg):  self.robot_accel = msg.data
+    def cb_pid(self, msg):    self.pid_error   = msg.data
+    def cb_ultra_front(self, msg): self.ultra_front = max(0.0, msg.data)
+    def cb_ultra_rear(self, msg):  self.ultra_rear  = max(0.0, msg.data)
+
+# =========================
+# TERMINAL MONITOR (ทำงานทุกกรณี ทั้ง headless และ GUI)
+# =========================
+
+def terminal_loop(node):
+    while True:
+        e = node.encoder; f = node.ultra_front; r = node.ultra_rear
+        print(
+            f"\r[{node.last_cmd:10s}] "
+            f"LB:{e['LB']:6.1f} LF:{e['LF']:6.1f} "
+            f"RB:{e['RB']:6.1f} RF:{e['RF']:6.1f} cm | "
+            f"Spd:{node.robot_speed:6.2f} Acc:{node.robot_accel:6.2f} "
+            f"PID:{node.pid_error:6.2f} | "
+            f"UF:{f:5.1f} UR:{r:5.1f} err:{f-r:+5.1f}cm",
+            end="", flush=True
+        )
+        time.sleep(0.2)
+
+# =========================
+# FIGURE SETUP
+# =========================
+
+def setup_figure():
+    plt.style.use("dark_background")
+    fig = plt.figure(figsize=(14, 9))
+    fig.suptitle("Motor Monitor + Ultrasonic PID", color='white',
+                 fontsize=12, fontweight='bold')
+    gs = gridspec.GridSpec(4, 2, figure=fig,
+                           left=0.07, right=0.97,
+                           top=0.92, bottom=0.22,
+                           hspace=0.5, wspace=0.3)
+
+    ax_spd = fig.add_subplot(gs[0,0]); ax_acc = fig.add_subplot(gs[1,0])
+    ax_pid = fig.add_subplot(gs[2,0]); ax_enc = fig.add_subplot(gs[3,0])
+    ax_uf  = fig.add_subplot(gs[0:2,1])
+    ax_err = fig.add_subplot(gs[2,1]);  ax_upid= fig.add_subplot(gs[3,1])
+
+    l_spd, = ax_spd.plot([], [], color='#4fc3f7', lw=1.5, label='Speed (cm/s)')
+    l_acc, = ax_acc.plot([], [], color='#81c784', lw=1.5, label='Accel (cm/s²)')
+    l_pid, = ax_pid.plot([], [], color='#f06292', lw=1.5, label='PID error')
+    l_enc, = ax_enc.plot([], [], color='#ffb74d', lw=1.5, label='Distance (cm)')
+    l_uf,  = ax_uf.plot([], [], color='#4fc3f7', lw=2, label='Front (cm)')
+    l_ur,  = ax_uf.plot([], [], color='#ff8a65', lw=2, label='Rear  (cm)')
+    l_sp   = ax_uf.axhline(y=ultra_pid["setpoint_dist"],
+                            color='#ffff00', lw=1.2, ls='--', label='Setpoint')
+    l_err, = ax_err.plot([], [], color='#ce93d8', lw=1.5, label='F-R error (cm)')
+    ax_err.axhline(y=0, color='white', lw=0.5, ls='--')
+    l_upid_r, = ax_upid.plot([], [], color='#80cbc4', lw=1.5, label='PID rotate')
+    l_upid_f, = ax_upid.plot([], [], color='#a5d6a7', lw=1.5, label='PID forward')
+    ax_upid.axhline(y=0, color='white', lw=0.5, ls='--')
+
+    for ax, title in [(ax_spd,'Speed'),(ax_acc,'Accel'),(ax_pid,'Drive PID'),
+                      (ax_enc,'Distance'),(ax_uf,'Ultrasonic F/R'),
+                      (ax_err,'F-R Error'),(ax_upid,'Ultra PID Output')]:
+        ax.set_title(title, fontsize=8, color='#ccc', pad=2)
+        ax.legend(fontsize=7, loc='upper left')
+        ax.grid(True, alpha=0.2); ax.tick_params(labelsize=7)
+
+    # Sliders
+    ax_kp  = fig.add_axes([0.07,0.16,0.20,0.022])
+    ax_ki  = fig.add_axes([0.07,0.13,0.20,0.022])
+    ax_kd  = fig.add_axes([0.07,0.10,0.20,0.022])
+    ax_kpf = fig.add_axes([0.35,0.16,0.20,0.022])
+    ax_kif = fig.add_axes([0.35,0.13,0.20,0.022])
+    ax_kdf = fig.add_axes([0.35,0.10,0.20,0.022])
+    ax_spdist = fig.add_axes([0.63,0.14,0.20,0.022])
+    ax_spdiff = fig.add_axes([0.63,0.10,0.20,0.022])
+
+    s_kp  = Slider(ax_kp,  'Kp rot', 0.0,5.0,  valinit=ultra_pid["Kp"],   color='#4fc3f7')
+    s_ki  = Slider(ax_ki,  'Ki rot', 0.0,1.0,  valinit=ultra_pid["Ki"],   color='#81c784')
+    s_kd  = Slider(ax_kd,  'Kd rot', 0.0,2.0,  valinit=ultra_pid["Kd"],   color='#f06292')
+    s_kpf = Slider(ax_kpf, 'Kp fwd', 0.0,5.0,  valinit=ultra_pid["Kp_f"],color='#ffb74d')
+    s_kif = Slider(ax_kif, 'Ki fwd', 0.0,1.0,  valinit=ultra_pid["Ki_f"],color='#ce93d8')
+    s_kdf = Slider(ax_kdf, 'Kd fwd', 0.0,2.0,  valinit=ultra_pid["Kd_f"],color='#80cbc4')
+    s_dist= Slider(ax_spdist,'Setpoint dist',3.0,50.0,
+                   valinit=ultra_pid["setpoint_dist"],color='#ffff00')
+    s_diff= Slider(ax_spdiff,'Setpoint diff',-10.0,10.0,
+                   valinit=ultra_pid["setpoint_diff"],color='#ff8a65')
+
+    for s in [s_kp,s_ki,s_kd,s_kpf,s_kif,s_kdf,s_dist,s_diff]:
+        s.label.set_color('white'); s.valtext.set_color('white')
+
+    s_kp.on_changed(lambda v: ultra_pid.update({"Kp":v}))
+    s_ki.on_changed(lambda v: ultra_pid.update({"Ki":v}))
+    s_kd.on_changed(lambda v: ultra_pid.update({"Kd":v}))
+    s_kpf.on_changed(lambda v: ultra_pid.update({"Kp_f":v}))
+    s_kif.on_changed(lambda v: ultra_pid.update({"Ki_f":v}))
+    s_kdf.on_changed(lambda v: ultra_pid.update({"Kd_f":v}))
+    s_dist.on_changed(lambda v: (ultra_pid.update({"setpoint_dist":v}), l_sp.set_ydata([v,v])))
+    s_diff.on_changed(lambda v: ultra_pid.update({"setpoint_diff":v}))
+
+    fig.text(0.07,0.195,'Rotate PID', color='#4fc3f7',fontsize=8,fontweight='bold')
+    fig.text(0.35,0.195,'Forward PID',color='#ffb74d',fontsize=8,fontweight='bold')
+    fig.text(0.63,0.18, 'Setpoints',  color='#ffff00',fontsize=8,fontweight='bold')
+
+    ax_rst  = fig.add_axes([0.88,0.12,0.08,0.04])
+    btn_rst = Button(ax_rst,'Reset\nIntegral',color='#333',hovercolor='#555')
+    btn_rst.label.set_color('white'); btn_rst.label.set_fontsize(8)
+    def on_reset(e):
+        ultra_pid["integral_r"] = 0.0; ultra_pid["integral_f"] = 0.0
+        print("\n[PID] Integral reset")
+    btn_rst.on_clicked(on_reset)
+
+    lines = (l_spd,l_acc,l_pid,l_enc,l_uf,l_ur,l_err,l_upid_r,l_upid_f,l_sp)
+    axes  = (ax_spd,ax_acc,ax_pid,ax_enc,ax_uf,ax_err,ax_upid)
+    return fig, lines, axes, (s_kp,s_ki,s_kd,s_kpf,s_kif,s_kdf,s_dist,s_diff,btn_rst)
+
+# =========================
+# UPDATE FUNCTION
+# =========================
+
+def make_update(lines, axes):
+    l_spd,l_acc,l_pid,l_enc,l_uf,l_ur,l_err,l_upid_r,l_upid_f,l_sp = lines
+    ax_spd,ax_acc,ax_pid,ax_enc,ax_uf,ax_err,ax_upid = axes
+
+    def update(frame, node):
+        t = time.time() - start_time
+        f = node.ultra_front; r = node.ultra_rear
+        time_data.append(t)
+        spd_data.append(node.robot_speed); acc_data.append(node.robot_accel)
+        pid_data.append(node.pid_error)
+        uf_data.append(f); ur_data.append(r); err_data.append(f-r)
+        pid_rot = compute_pid_rotate(f,r)  if f>0 and r>0 else 0.0
+        pid_fwd = compute_pid_forward(f,r) if f>0 and r>0 else 0.0
+        upid_r.append(pid_rot); upid_f.append(pid_fwd)
+        if len(time_data) < 2: return
+        tl = list(time_data); xl = (max(0,tl[-1]-15), tl[-1]+0.5)
+        def plot(line, ax, ydata, ylim):
+            n=min(len(tl),len(ydata)); line.set_data(tl[:n],list(ydata)[:n])
+            ax.set_xlim(*xl); ax.set_ylim(*ylim)
+        plot(l_spd,ax_spd,spd_data,(-60,60))
+        plot(l_acc,ax_acc,acc_data,(-60,60))
+        plot(l_pid,ax_pid,pid_data,(-300,300))
+        enc_l=list(enc_data); n=min(len(tl),len(enc_l))
+        if n>0: l_enc.set_data(tl[:n],enc_l[:n])
+        ax_enc.set_xlim(*xl); ax_enc.set_ylim(-200,200)
+        uf_l=list(uf_data); ur_l=list(ur_data)
+        n=min(len(tl),len(uf_l),len(ur_l))
+        l_uf.set_data(tl[:n],uf_l[:n]); l_ur.set_data(tl[:n],ur_l[:n])
+        ax_uf.set_xlim(*xl)
+        all_v=uf_l+ur_l
+        if all_v: ax_uf.set_ylim(max(0,min(all_v)-5),max(all_v)+5)
+        plot(l_err,ax_err,err_data,(-30,30))
+        pr_l=list(upid_r); pf_l=list(upid_f)
+        n=min(len(tl),len(pr_l)); l_upid_r.set_data(tl[:n],pr_l[:n])
+        n=min(len(tl),len(pf_l)); l_upid_f.set_data(tl[:n],pf_l[:n])
+        ax_upid.set_xlim(*xl); ax_upid.set_ylim(-30,30)
+    return update
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    rclpy.init()
+    node = MotorNode()
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    threading.Thread(target=executor.spin, daemon=True).start()
+    threading.Thread(target=terminal_loop, args=(node,), daemon=True).start()
+
+    if HEADLESS:
+        # ✅ ไม่มี display — รัน terminal only
+        print("[INFO] No display detected — running terminal monitor only")
+        print("[INFO] ดูกราฟได้โดยรัน: DISPLAY=:0 ros2 run robot_pkg motor")
+        try:
+            while rclpy.ok():
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+    else:
+        # ✅ มี display — รัน GUI + graph
+        fig, lines, axes, widgets = setup_figure()
+        update_fn = make_update(lines, axes)
+        _ani = FuncAnimation(fig, lambda frame: update_fn(frame, node),
+                             interval=100, cache_frame_data=False)
+        plt.show()
+
+    rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
