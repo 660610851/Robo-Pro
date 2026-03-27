@@ -1,0 +1,174 @@
+import cv2
+import numpy as np
+import os
+import threading
+import time
+
+from ultralytics import YOLO
+
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import String, Float32
+
+
+# =============================
+# SETTINGS
+# =============================
+
+CAB_MODEL_PATH = os.path.expanduser("~/cabbage.pt")
+
+PI_IP = "pingg.local"
+STREAM_URL = f"http://{PI_IP}:5001/stream"
+
+CONF = 0.35
+IMGSZ = 320
+CAB_THRESH = 15.0
+
+REAL_CABBAGE_CM = 12.3
+CAMERA_DISTANCE_CM = 23.5
+
+FOCAL_LENGTH_PX = None
+
+DISPLAY_W, DISPLAY_H = 640, 480  # ✅ เพิ่ม: กำหนดขนาดหน้าต่างคงที่
+
+
+# =============================
+# FRAME READER
+# =============================
+
+class FreshFrame:
+
+    def __init__(self, url):
+        self.cap = cv2.VideoCapture(url)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)   # ✅ เพิ่ม: timeout เปิด connection
+        self.cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 5000)   # ✅ เพิ่ม: timeout อ่านเฟรม
+
+        self.frame = None
+        self.ret = False
+        self.running = True
+
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
+
+    def _update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                self.frame = frame
+                self.ret = True
+            time.sleep(1 / 30)  # ✅ เพิ่ม: จำกัด loop ไม่ให้วนเร็วเกินไป กัน CPU spike
+
+    def read(self):
+        return self.ret, self.frame
+
+    def release(self):
+        self.running = False
+        self.cap.release()
+
+
+# =============================
+# ROS2 NODE
+# =============================
+
+class VisionNode(Node):
+
+    def __init__(self):
+        super().__init__('vision_node')
+        self.cab_size_pub = self.create_publisher(Float32, '/cabbage_size', 10)
+        self.cab_status_pub = self.create_publisher(String, '/cabbage_status', 10)
+
+    def publish(self, cab_size, cab_status):
+        size_msg = Float32()
+        size_msg.data = float(cab_size) if cab_size else -1.0
+
+        status_msg = String()
+        status_msg.data = cab_status
+
+        self.cab_size_pub.publish(size_msg)
+        self.cab_status_pub.publish(status_msg)
+
+
+# =============================
+# CALIBRATE FOCAL
+# =============================
+
+def calibrate_focal(pixel_width):
+    global FOCAL_LENGTH_PX
+    if pixel_width <= 0:
+        return
+    FOCAL_LENGTH_PX = (pixel_width * CAMERA_DISTANCE_CM) / REAL_CABBAGE_CM
+    print("FOCAL LENGTH =", FOCAL_LENGTH_PX)
+
+
+# =============================
+# MAIN
+# =============================
+
+def main():
+    rclpy.init()
+    node = VisionNode()
+    threading.Thread(target=rclpy.spin, args=(node,), daemon=True).start()
+
+    model = YOLO(CAB_MODEL_PATH)
+    stream = FreshFrame(STREAM_URL)
+
+    while rclpy.ok():
+        ret, frame = stream.read()
+        if not ret or frame is None:
+            continue
+
+        vis = frame.copy()
+        cab_size = None
+        cab_status = "NONE"
+
+        results = model.predict(
+            frame,
+            conf=CONF,
+            imgsz=IMGSZ,
+            verbose=False
+        )[0]
+
+        if results.boxes is not None:
+            for b in results.boxes:
+                x1, y1, x2, y2 = b.xyxy[0].cpu().numpy().astype(int)
+                diam_px = min(x2 - x1, y2 - y1)
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+
+                if FOCAL_LENGTH_PX is None:
+                    calibrate_focal(diam_px)
+                if FOCAL_LENGTH_PX is None:
+                    continue
+
+                diam_cm = (diam_px * CAMERA_DISTANCE_CM) / FOCAL_LENGTH_PX
+                cab_size = diam_cm
+                cab_status = "CAN_COLLECT" if diam_cm >= CAB_THRESH else "WAIT"
+                color = (0, 255, 0) if cab_status == "CAN_COLLECT" else (0, 0, 255)
+
+                cv2.circle(vis, (cx, cy), diam_px // 2, color, 2)
+                cv2.putText(
+                    vis,
+                    f"{diam_cm:.1f} cm",
+                    (cx - 20, cy),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    color,
+                    2
+                )
+
+        node.publish(cab_size, cab_status)
+
+        vis = cv2.resize(vis, (DISPLAY_W, DISPLAY_H))  # ✅ เพิ่ม: resize ก่อนแสดง กันภาพใหญ่ผิดปกติ
+        cv2.imshow("Robot Vision", vis)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    stream.release()
+    cv2.destroyAllWindows()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
