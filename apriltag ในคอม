@@ -1,0 +1,441 @@
+import cv2
+import numpy as np
+from pupil_apriltags import Detector
+import threading
+import time
+import os
+
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Point
+from std_msgs.msg import Int32, Bool, Float32, String
+
+# =========================
+# CONFIG
+# =========================
+
+CENTER_THRESH    = 40
+TAG_SIZE         = 0.07
+CALIB_DISTANCE_M = 1.55
+FOCAL_LENGTH_FILE= "focal_length.txt"
+FILTER_SIZE      = 7
+MAX_LOST         = 25
+CONFIRM_FRAMES   = 2
+
+PI_IP      = "pingg.local"
+STREAM_URL = f"http://{PI_IP}:5000/stream"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;3000000"
+
+# ✅ หมุนภาพก่อน detect
+# 0=ไม่หมุน, 90=หมุน90°, 180=หมุน180°, 270=หมุน270°
+ROTATE_FRAME = 0
+
+# =========================
+# DETECTOR
+# =========================
+
+at_detector = Detector(
+    families="tagStandard52h13",
+    nthreads=4,
+    quad_decimate=1.0,
+    quad_sigma=0.0,
+    refine_edges=1,
+    decode_sharpening=0.8,
+)
+
+# =========================
+# PREPROCESSING
+# =========================
+
+PREPROCESS_MODE = "auto"
+
+_clahe_low  = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8,8))
+_clahe_mid  = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8,8))
+_clahe_high = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
+_sharpen_k  = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]], dtype=np.float32)
+
+def preprocess(gray):
+    mode = PREPROCESS_MODE
+    if mode == "auto":
+        b = gray.mean()
+        mode = "night_bright" if b>160 else "night_dark" if b<80 else "day"
+
+    if mode == "night_bright":
+        lut  = np.array([min(255,int((i/255)**1.6*255)) for i in range(256)],np.uint8)
+        gray = cv2.LUT(gray, lut)
+        gray = _clahe_low.apply(gray)
+    elif mode == "night_dark":
+        gray = _clahe_high.apply(gray)
+    else:
+        gray = _clahe_mid.apply(gray)
+
+    gray = cv2.filter2D(gray, -1, _sharpen_k)
+    return gray
+
+def rotate_frame(frame, angle):
+    if angle == 0:   return frame
+    if angle == 90:  return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180: return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270: return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+# =========================
+# HELPERS
+# =========================
+
+def decode_tagid_5digits(tag_id):
+    s = f"{tag_id:05d}"
+    return s, int(s[0:2]), int(s[2])*5, int(s[3:5])
+
+def tag_area(tag):
+    c = tag.corners
+    return np.linalg.norm(c[0]-c[1]) * np.linalg.norm(c[1]-c[2])
+
+def tag_avg_pixels(tag):
+    c = tag.corners
+    return (np.linalg.norm(c[0]-c[1]) + np.linalg.norm(c[1]-c[2])) / 2.0
+
+def save_focal(fl):
+    with open(FOCAL_LENGTH_FILE,"w") as f: f.write(str(fl))
+    print(f"[CALIB] FL={fl:.2f} saved")
+
+def load_focal():
+    try:
+        with open(FOCAL_LENGTH_FILE) as f: fl=float(f.read().strip())
+        print(f"[CALIB] FL={fl:.2f} loaded"); return fl
+    except: return None
+
+# =========================
+# FRESH FRAME
+# =========================
+
+class FreshFrame:
+    def __init__(self, url):
+        self.cap = cv2.VideoCapture(url)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.has_frame = False
+        self.running = True
+        threading.Thread(target=self._update, daemon=True).start()
+
+    def _update(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self.lock:
+                    self.latest_frame = frame
+                    self.has_frame = True
+
+    def read(self):
+        with self.lock:
+            if not self.has_frame: return False, None
+            return True, self.latest_frame.copy()
+
+    def release(self):
+        self.running = False; self.cap.release()
+
+# =========================
+# DETECTION RESULT
+# =========================
+
+class DetectionResult:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self._d   = dict(frame=None,chosen=None,aligned=False,
+                         distance=-1.0,cx=0,cy=0,tag_str="",
+                         planting=0,spacing=0,interval=0,
+                         avg_px=0.0,offset=0,fps=0,
+                         lock_state="SEARCHING",cx_frame=320,
+                         debug_frame=None,ready=False)
+
+    def update(self,**kw):
+        with self.lock:
+            self._d.update(kw); self._d['ready']=True
+
+    def get(self):
+        with self.lock: return dict(self._d)
+
+# =========================
+# DETECTION THREAD
+# =========================
+
+class DetectionThread:
+    def __init__(self, stream, node, result):
+        self.stream=stream; self.node=node; self.result=result
+        self.running=True
+        self._fl_lock=threading.Lock(); self._fl=load_focal(); self._dist_h=[]
+        self._locked_id=None; self._lost_count=0
+        self._candidate_id=None; self._confirm_count=0
+        self._fps_t=time.time(); self._fps_c=0; self._fps=0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    @property
+    def focal_length(self):
+        with self._fl_lock: return self._fl
+
+    def set_focal_length(self,fl):
+        with self._fl_lock: self._fl=fl; self._dist_h.clear()
+
+    def _dist(self,tag):
+        fl=self.focal_length
+        if fl is None: return -1.0
+        px=tag_avg_pixels(tag)
+        if px<=0: return 0.0
+        d=(TAG_SIZE*fl)/px
+        self._dist_h.append(d)
+        if len(self._dist_h)>FILTER_SIZE: self._dist_h.pop(0)
+        return float(np.median(self._dist_h))
+
+    def _update_lock(self,tags):
+        tag_map={t.tag_id:t for t in tags}
+        if self._locked_id is not None:
+            if self._locked_id in tag_map:
+                self._lost_count=0; return tag_map[self._locked_id]
+            self._lost_count+=1
+            if self._lost_count>=MAX_LOST:
+                self._locked_id=None; self._lost_count=0
+                self._candidate_id=None; self._confirm_count=0
+            return None
+        if not tags:
+            self._candidate_id=None; self._confirm_count=0; return None
+        best=max(tags,key=tag_area)
+        if best.tag_id!=self._candidate_id:
+            self._candidate_id=best.tag_id; self._confirm_count=1
+        else: self._confirm_count+=1
+        if self._confirm_count>=CONFIRM_FRAMES:
+            self._locked_id=self._candidate_id
+            self._lost_count=0; self._confirm_count=0
+            return tag_map[self._locked_id]
+        return None
+
+    def _lock_state(self):
+        if self._locked_id is not None: return f"LOCKED({self._locked_id})"
+        if self._candidate_id is not None: return f"CONFIRM {self._confirm_count}/{CONFIRM_FRAMES}"
+        return "SEARCHING"
+
+    def _run(self):
+        while self.running:
+            ret,frame=self.stream.read()
+            if not ret or frame is None: time.sleep(0.005); continue
+
+            # ✅ หมุน frame ก่อน detect
+            frame_rot = rotate_frame(frame, ROTATE_FRAME)
+
+            h,w=frame_rot.shape[:2]; cx_frame=w//2
+
+            gray=cv2.cvtColor(frame_rot,cv2.COLOR_BGR2GRAY)
+            gray_proc=preprocess(gray)
+            tags=at_detector.detect(gray_proc)
+            chosen=self._update_lock(tags)
+
+            debug_frame=cv2.cvtColor(gray_proc,cv2.COLOR_GRAY2BGR)
+
+            aligned=False; cx=cy=0; tag_str=""
+            planting=spacing=interval=0; avg_px=0.0; offset=0; distance=-1.0
+
+            if chosen is not None:
+                tag_str,planting,spacing,interval=decode_tagid_5digits(chosen.tag_id)
+                cx,cy=map(int,chosen.center)
+                distance=self._dist(chosen)
+                avg_px=tag_avg_pixels(chosen)
+                offset=cx-cx_frame
+                aligned=abs(offset)<=CENTER_THRESH
+                if distance>0:
+                    self.node.publish_tag(cx,cy,chosen.tag_id,
+                                          planting,spacing,interval,
+                                          distance,aligned,cx_frame)
+            else:
+                self.node.publish_lost()
+
+            self._fps_c+=1
+            now=time.time()
+            if now-self._fps_t>=1.0:
+                self._fps=self._fps_c; self._fps_c=0; self._fps_t=now
+
+            self.result.update(
+                frame=frame_rot, chosen=chosen, aligned=aligned,
+                distance=distance, cx=cx, cy=cy,
+                tag_str=tag_str, planting=planting, spacing=spacing,
+                interval=interval, avg_px=avg_px, offset=offset,
+                fps=self._fps, lock_state=self._lock_state(),
+                cx_frame=cx_frame, debug_frame=debug_frame,
+            )
+
+    def stop(self): self.running=False
+
+# =========================
+# ROS2 NODE
+# =========================
+
+class AprilTagNode(Node):
+    def __init__(self):
+        super().__init__('apriltag_detector')
+        self.pos_pub      = self.create_publisher(Point,   '/tag_position',10)
+        self.id_pub       = self.create_publisher(Int32,   '/tag_id',      10)
+        self.detect_pub   = self.create_publisher(Bool,    '/tag_detected',10)
+        self.planting_pub = self.create_publisher(Int32,   '/tag_planting',10)
+        self.spacing_pub  = self.create_publisher(Int32,   '/tag_spacing', 10)
+        self.cabbage_pub  = self.create_publisher(Int32,   '/tag_cabbage', 10)
+        self.dist_pub     = self.create_publisher(Float32, '/tag_distance',10)
+        self.aligned_pub  = self.create_publisher(Bool,    '/tag_aligned', 10)
+        self.side_pub     = self.create_publisher(String,  '/tag_side',    10)
+        self.get_logger().info("AprilTag Node started")
+
+    def publish_tag(self,cx,cy,tag_id,planting,spacing,cabbage,distance,aligned,cx_frame):
+        pos=Point(); pos.x=float(cx); pos.y=float(cy); pos.z=0.0
+        self.pos_pub.publish(pos)
+        m=Int32();  m.data=tag_id;          self.id_pub.publish(m)
+        m=Bool();   m.data=True;            self.detect_pub.publish(m)
+        m=Int32();  m.data=planting;        self.planting_pub.publish(m)
+        m=Int32();  m.data=spacing;         self.spacing_pub.publish(m)
+        m=Int32();  m.data=cabbage;         self.cabbage_pub.publish(m)
+        m=Float32();m.data=float(distance); self.dist_pub.publish(m)
+        m=Bool();   m.data=aligned;         self.aligned_pub.publish(m)
+        m=String(); m.data="LEFT" if cx<cx_frame else "RIGHT"
+        self.side_pub.publish(m)
+
+    def publish_lost(self):
+        m=Bool();   m.data=False;  self.detect_pub.publish(m)
+        m=Bool();   m.data=False;  self.aligned_pub.publish(m)
+        m=String(); m.data="NONE"; self.side_pub.publish(m)
+
+# =========================
+# OVERLAY
+# =========================
+
+def draw_overlay(frame, d, fl):
+    h,w=frame.shape[:2]; cx_frame=d.get('cx_frame',w//2)
+    chosen=d['chosen']; aligned=d['aligned']; cx=d['cx']
+
+    if chosen is not None:
+        corners=chosen.corners.astype(int)
+        col=(0,255,0) if aligned else (0,180,255)
+        for i in range(4):
+            cv2.line(frame,tuple(corners[i]),tuple(corners[(i+1)%4]),col,2)
+        cv2.drawMarker(frame,(cx,d['cy']),(0,0,255),cv2.MARKER_CROSS,20,2)
+        dist_t=f"{d['distance']:.2f}m" if d['distance']>0 else "-- calib --"
+        aln_t ="ALIGNED" if aligned else f"offset {d['offset']:+d}px"
+        aln_c =(0,255,0) if aligned else (0,0,255)
+        cv2.putText(frame,f"TAG {d['tag_str']}",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.8,(255,255,255),2)
+        cv2.putText(frame,f"Dist: {dist_t}",    (10,60),cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),  2)
+        cv2.putText(frame,aln_t,                 (10,90),cv2.FONT_HERSHEY_SIMPLEX,0.7,aln_c,        2)
+        cv2.putText(frame,d.get('lock_state',''), (10,120),cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,220,100),2)
+        side_now="LEFT" if cx<cx_frame else "RIGHT"
+        cv2.putText(frame,f"SIDE:{side_now}",(cx_frame-70,h-40),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,
+                    (100,200,255) if side_now=="LEFT" else (255,180,100),2)
+    else:
+        cv2.putText(frame,"Searching...",(10,30),cv2.FONT_HERSHEY_SIMPLEX,0.8,(0,0,255),2)
+        cv2.putText(frame,d.get('lock_state','SEARCHING'),(10,60),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.6,(100,100,255),2)
+
+    lc=(0,255,0) if aligned else (0,255,255)
+    cv2.line(frame,(cx_frame,0),(cx_frame,h),lc,2)
+    cv2.line(frame,(cx_frame-CENTER_THRESH,0),(cx_frame-CENTER_THRESH,h),(0,180,180),1)
+    cv2.line(frame,(cx_frame+CENTER_THRESH,0),(cx_frame+CENTER_THRESH,h),(0,180,180),1)
+    cv2.putText(frame,"LEFT", (10,h//2),          cv2.FONT_HERSHEY_SIMPLEX,1.0,(100,200,255),2)
+    cv2.putText(frame,"RIGHT",(cx_frame+10,h//2), cv2.FONT_HERSHEY_SIMPLEX,1.0,(255,180,100),2)
+    cv2.putText(frame,f"FPS:{d['fps']}",(10,150), cv2.FONT_HERSHEY_SIMPLEX,0.6,(255,255,0),  2)
+
+    rot_text=f"ROT:{ROTATE_FRAME}°" if ROTATE_FRAME else "ROT:0 [R]"
+    fl_t=f"FL={fl:.0f}" if fl else "FL=? [C]"
+    cv2.putText(frame,f"{fl_t}  {rot_text}  mode:{PREPROCESS_MODE}",
+                (10,h-10),cv2.FONT_HERSHEY_SIMPLEX,0.45,(180,180,180),1)
+    return frame
+
+# =========================
+# MAIN
+# =========================
+
+def main():
+    global PREPROCESS_MODE, ROTATE_FRAME
+
+    rclpy.init()
+    node=AprilTagNode()
+    threading.Thread(target=rclpy.spin,args=(node,),daemon=True).start()
+
+    print("="*55)
+    print("  AprilTag Detector")
+    print(f"  Stream: {STREAM_URL}")
+    print(f"  rotate: {ROTATE_FRAME}°  (กด R วนเปลี่ยน)")
+    print("="*55)
+    print("Keys:")
+    print("  c = calibrate")
+    print("  r = หมุนภาพ 0→90→180→270→0")
+    print("  d = debug window")
+    print("  1=auto 2=night_bright 3=night_dark 4=day")
+    print("  q = quit\n")
+
+    stream=FreshFrame(STREAM_URL)
+    print("[WAIT] รอ stream...")
+    for _ in range(100):
+        if stream.has_frame: break
+        time.sleep(0.1)
+    print("[OK]" if stream.has_frame else "[WARN] ไม่มี stream")
+
+    result=DetectionResult()
+    det=DetectionThread(stream,node,result)
+
+    if det.focal_length is None:
+        print(f"[CALIB] วาง tag {CALIB_DISTANCE_M}m แล้วกด 'c'")
+    else:
+        print(f"[CALIB] FL={det.focal_length:.2f}")
+
+    DISPLAY_W,DISPLAY_H=960,720
+    WIN="AprilTag Tracking"
+    cv2.namedWindow(WIN,cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WIN,DISPLAY_W,DISPLAY_H)
+    show_debug=False
+
+    while rclpy.ok():
+        d=result.get()
+        if not d['ready'] or d['frame'] is None:
+            ph=np.full((DISPLAY_H,DISPLAY_W,3),40,np.uint8)
+            cv2.putText(ph,"Waiting stream...",(DISPLAY_W//2-120,DISPLAY_H//2),
+                        cv2.FONT_HERSHEY_SIMPLEX,1,(0,200,255),2)
+            cv2.imshow(WIN,ph)
+            if cv2.waitKey(100)&0xFF==ord('q'): break
+            continue
+
+        frame=draw_overlay(d['frame'].copy(),d,det.focal_length)
+        frame=cv2.resize(frame,(DISPLAY_W,DISPLAY_H),interpolation=cv2.INTER_LINEAR)
+        cv2.imshow(WIN,frame)
+
+        if show_debug and d['debug_frame'] is not None:
+            dbg=cv2.resize(d['debug_frame'],(480,360))
+            cv2.putText(dbg,f"mode:{PREPROCESS_MODE} rot:{ROTATE_FRAME}",
+                        (5,20),cv2.FONT_HERSHEY_SIMPLEX,0.55,(0,255,255),1)
+            cv2.imshow("Debug preprocessed",dbg)
+
+        key=cv2.waitKey(1)&0xFF
+
+        if key==ord('c'):
+            chosen=d['chosen']
+            if chosen:
+                px=tag_avg_pixels(chosen)
+                fl=(px*CALIB_DISTANCE_M)/TAG_SIZE
+                det.set_focal_length(fl); save_focal(fl)
+                print(f"[CALIB] px={px:.1f} → FL={fl:.2f}")
+            else: print("[CALIB] ไม่เห็น tag")
+
+        elif key==ord('r'):
+            ROTATE_FRAME=(ROTATE_FRAME+90)%360
+            print(f"[ROTATE] {ROTATE_FRAME}°")
+
+        elif key==ord('d'):
+            show_debug=not show_debug
+            if not show_debug: cv2.destroyWindow("Debug preprocessed")
+
+        elif key==ord('1'): PREPROCESS_MODE="auto";         print("[MODE] auto")
+        elif key==ord('2'): PREPROCESS_MODE="night_bright"; print("[MODE] night_bright")
+        elif key==ord('3'): PREPROCESS_MODE="night_dark";   print("[MODE] night_dark")
+        elif key==ord('4'): PREPROCESS_MODE="day";          print("[MODE] day")
+        elif key==ord('q'): break
+
+    det.stop(); stream.release()
+    cv2.destroyAllWindows()
+    node.destroy_node(); rclpy.shutdown()
+
+if __name__=="__main__":
+    main()
